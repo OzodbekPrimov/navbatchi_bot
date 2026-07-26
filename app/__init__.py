@@ -1,0 +1,1 @@
+"""Navbatchi bot application."""

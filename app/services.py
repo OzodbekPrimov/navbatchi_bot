@@ -1,0 +1,362 @@
+from __future__ import annotations
+
+from datetime import UTC, date, datetime, time, timedelta
+from zoneinfo import ZoneInfo
+
+from sqlalchemy import Select, func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.models import (
+    AssignmentStatus,
+    CompletionPoll,
+    FoodAssignment,
+    FoodQueueMember,
+    NotificationKind,
+    NotificationLog,
+    PollStatus,
+    PollVote,
+    TransferRequest,
+    TransferStatus,
+    User,
+    VoteValue,
+)
+
+
+class DomainError(Exception):
+    """A business-rule error that can be shown to a bot user."""
+
+
+def utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
+async def get_or_create_user(
+    session: AsyncSession,
+    telegram_id: int,
+    full_name: str,
+    username: str | None,
+    is_admin: bool,
+) -> User:
+    user = await session.scalar(select(User).where(User.telegram_id == telegram_id))
+    if user is None:
+        user = User(
+            telegram_id=telegram_id,
+            full_name=full_name[:255],
+            username=username[:255] if username else None,
+            is_admin=is_admin,
+        )
+        session.add(user)
+    else:
+        user.full_name = full_name[:255]
+        user.username = username[:255] if username else None
+        user.is_admin = user.is_admin or is_admin
+    await session.commit()
+    return user
+
+
+async def get_user_by_telegram_id(session: AsyncSession, telegram_id: int) -> User | None:
+    return await session.scalar(select(User).where(User.telegram_id == telegram_id))
+
+
+async def is_queue_member(session: AsyncSession, user_id: int) -> bool:
+    return bool(
+        await session.scalar(
+            select(FoodQueueMember.id).where(
+                FoodQueueMember.user_id == user_id, FoodQueueMember.is_active.is_(True)
+            )
+        )
+    )
+
+
+async def active_queue(session: AsyncSession) -> list[tuple[FoodQueueMember, User]]:
+    result = await session.execute(
+        select(FoodQueueMember, User)
+        .join(User, User.id == FoodQueueMember.user_id)
+        .where(FoodQueueMember.is_active.is_(True))
+        .order_by(FoodQueueMember.position)
+    )
+    return list(result.all())
+
+
+async def add_queue_member(session: AsyncSession, user_id: int) -> None:
+    if await is_queue_member(session, user_id):
+        raise DomainError("Bu foydalanuvchi ovqat navbatida bor.")
+    user = await session.get(User, user_id)
+    if user is None:
+        raise DomainError("Foydalanuvchi topilmadi.")
+    existing = await session.scalar(select(FoodQueueMember).where(FoodQueueMember.user_id == user_id))
+    next_position = (
+        await session.scalar(select(func.max(FoodQueueMember.position)).where(FoodQueueMember.is_active.is_(True)))
+    ) or 0
+    if existing is not None:
+        existing.is_active = True
+        existing.position = next_position + 1
+    else:
+        session.add(FoodQueueMember(user_id=user_id, position=next_position + 1))
+    await session.commit()
+
+
+async def _get_member(session: AsyncSession, user_id: int, active_only: bool = True) -> FoodQueueMember | None:
+    statement: Select[tuple[FoodQueueMember]] = select(FoodQueueMember).where(FoodQueueMember.user_id == user_id)
+    if active_only:
+        statement = statement.where(FoodQueueMember.is_active.is_(True))
+    return await session.scalar(statement)
+
+
+async def remove_queue_member(session: AsyncSession, user_id: int) -> None:
+    member = await _get_member(session, user_id)
+    if member is None:
+        raise DomainError("Bu foydalanuvchi faol navbatda emas.")
+    current = await session.scalar(
+        select(FoodAssignment).where(FoodAssignment.status == AssignmentStatus.ACTIVE)
+    )
+    if current and user_id in {current.assigned_user_id, current.scheduled_user_id}:
+        raise DomainError("Bugungi navbatdagi odamni avval almashtiring, keyin ro‘yxatdan o‘chiring.")
+    member.is_active = False
+    # Inactive members must not block the unique order positions of active members.
+    member.position = -member.id
+    await session.commit()
+
+
+async def move_queue_member(session: AsyncSession, user_id: int, direction: int) -> None:
+    entries = await active_queue(session)
+    index = next((i for i, (member, _) in enumerate(entries) if member.user_id == user_id), None)
+    if index is None:
+        raise DomainError("Foydalanuvchi faol navbatda emas.")
+    other_index = index + direction
+    if other_index < 0 or other_index >= len(entries):
+        return
+    entries[index], entries[other_index] = entries[other_index], entries[index]
+    # Avoid a temporary unique-position collision while rewriting the order.
+    for member, _ in entries:
+        member.position = -(10_000 + member.id)
+    await session.flush()
+    for position, (member, _) in enumerate(entries, start=1):
+        member.position = position
+    await session.commit()
+
+
+async def _next_queue_user(session: AsyncSession, scheduled_user_id: int) -> int:
+    current = await _get_member(session, scheduled_user_id, active_only=False)
+    active = await active_queue(session)
+    if not active:
+        raise DomainError("Ovqat navbati bo‘sh.")
+    if current:
+        for member, _ in active:
+            if member.position > current.position:
+                return member.user_id
+    return active[0][0].user_id
+
+
+async def get_assignment_for_date(session: AsyncSession, duty_date: date) -> FoodAssignment | None:
+    return await session.scalar(select(FoodAssignment).where(FoodAssignment.duty_date == duty_date))
+
+
+async def create_initial_assignment(session: AsyncSession, duty_date: date, user_id: int) -> FoodAssignment:
+    if not await is_queue_member(session, user_id):
+        raise DomainError("Boshlang‘ich navbatchi ovqat navbatida bo‘lishi kerak.")
+    assignment = await get_assignment_for_date(session, duty_date)
+    if assignment is not None:
+        raise DomainError("Bugungi navbat allaqachon yaratilgan.")
+    assignment = FoodAssignment(duty_date=duty_date, scheduled_user_id=user_id, assigned_user_id=user_id)
+    session.add(assignment)
+    await session.commit()
+    return assignment
+
+
+async def current_assignment(session: AsyncSession, duty_date: date) -> FoodAssignment | None:
+    return await session.scalar(
+        select(FoodAssignment).where(
+            FoodAssignment.duty_date == duty_date, FoodAssignment.status == AssignmentStatus.ACTIVE
+        )
+    )
+
+
+async def create_completion_poll(
+    session: AsyncSession, assignment: FoodAssignment, timezone_name: str
+) -> CompletionPoll:
+    existing = await session.scalar(
+        select(CompletionPoll).where(CompletionPoll.assignment_id == assignment.id)
+    )
+    if existing:
+        return existing
+    zone = ZoneInfo(timezone_name)
+    closes_at = datetime.combine(assignment.duty_date + timedelta(days=1), time(0, 15), zone).astimezone(UTC)
+    poll = CompletionPoll(assignment_id=assignment.id, closes_at=closes_at)
+    session.add(poll)
+    await session.commit()
+    return poll
+
+
+async def cast_vote(
+    session: AsyncSession, poll_id: int, voter_id: int, value: VoteValue, now: datetime | None = None
+) -> None:
+    now = now or utc_now()
+    poll = await session.get(CompletionPoll, poll_id)
+    if poll is None or poll.status != PollStatus.OPEN or poll.closes_at <= now:
+        raise DomainError("Bu so‘rovnoma yopilgan.")
+    assignment = await session.get(FoodAssignment, poll.assignment_id)
+    if assignment is None or assignment.assigned_user_id == voter_id:
+        raise DomainError("Bu so‘rovnomada ovoz bera olmaysiz.")
+    if not await is_queue_member(session, voter_id):
+        raise DomainError("Faqat faol xonadoshlar ovoz bera oladi.")
+    vote = await session.scalar(
+        select(PollVote).where(PollVote.poll_id == poll_id, PollVote.voter_user_id == voter_id)
+    )
+    if vote is None:
+        session.add(PollVote(poll_id=poll_id, voter_user_id=voter_id, value=value))
+    else:
+        vote.value = value
+        vote.updated_at = now
+    await session.commit()
+
+
+async def resolve_poll(session: AsyncSession, poll: CompletionPoll, now: datetime | None = None) -> FoodAssignment:
+    now = now or utc_now()
+    if poll.status == PollStatus.CLOSED:
+        assignment = await session.get(FoodAssignment, poll.assignment_id)
+        assert assignment is not None
+        return assignment
+    if poll.closes_at > now:
+        raise DomainError("So‘rovnoma hali yopilmagan.")
+    assignment = await session.get(FoodAssignment, poll.assignment_id)
+    assert assignment is not None
+    no_votes = await session.scalar(
+        select(func.count(PollVote.id)).where(PollVote.poll_id == poll.id, PollVote.value == VoteValue.NO)
+    ) or 0
+    yes_votes = await session.scalar(
+        select(func.count(PollVote.id)).where(PollVote.poll_id == poll.id, PollVote.value == VoteValue.YES)
+    ) or 0
+    passed = no_votes < 2 and yes_votes > 0
+    assignment.status = AssignmentStatus.COMPLETED if passed else AssignmentStatus.NOT_COMPLETED
+    assignment.resolved_at = now
+    poll.status = PollStatus.CLOSED
+
+    tomorrow = assignment.duty_date + timedelta(days=1)
+    next_assignment = await get_assignment_for_date(session, tomorrow)
+    if next_assignment is None:
+        next_user_id = await _next_queue_user(session, assignment.scheduled_user_id) if passed else assignment.scheduled_user_id
+        next_assignment = FoodAssignment(
+            duty_date=tomorrow, scheduled_user_id=next_user_id, assigned_user_id=next_user_id
+        )
+        session.add(next_assignment)
+    await session.commit()
+    return assignment
+
+
+async def create_transfer_request(
+    session: AsyncSession, assignment: FoodAssignment, from_user_id: int, to_user_id: int, comment: str | None
+) -> TransferRequest:
+    if assignment.status != AssignmentStatus.ACTIVE or assignment.assigned_user_id != from_user_id:
+        raise DomainError("Bu navbatni o‘tkaza olmaysiz.")
+    if await session.scalar(select(CompletionPoll.id).where(CompletionPoll.assignment_id == assignment.id)):
+        raise DomainError("Kechki tekshiruv boshlanganidan keyin navbatni o‘tkazib bo‘lmaydi.")
+    if from_user_id == to_user_id or not await is_queue_member(session, to_user_id):
+        raise DomainError("Boshqa faol xonadoshni tanlang.")
+    await session.execute(
+        select(TransferRequest)
+        .where(TransferRequest.assignment_id == assignment.id, TransferRequest.status == TransferStatus.PENDING)
+        .with_for_update()
+    )
+    pending = await session.scalar(
+        select(TransferRequest.id).where(
+            TransferRequest.assignment_id == assignment.id, TransferRequest.status == TransferStatus.PENDING
+        )
+    )
+    if pending:
+        raise DomainError("Bu navbat uchun javobi kutilayotgan so‘rov bor.")
+    request = TransferRequest(
+        assignment_id=assignment.id, from_user_id=from_user_id, to_user_id=to_user_id, comment=comment or None
+    )
+    session.add(request)
+    await session.commit()
+    return request
+
+
+async def decide_transfer(
+    session: AsyncSession, request_id: int, recipient_user_id: int, accepted: bool
+) -> tuple[TransferRequest, FoodAssignment]:
+    request = await session.scalar(select(TransferRequest).where(TransferRequest.id == request_id).with_for_update())
+    if request is None or request.to_user_id != recipient_user_id:
+        raise DomainError("Bu so‘rov sizga tegishli emas.")
+    if request.status != TransferStatus.PENDING:
+        raise DomainError("Bu transfer so‘rovi avval yakunlangan.")
+    assignment = await session.get(FoodAssignment, request.assignment_id, with_for_update=True)
+    assert assignment is not None
+    if assignment.status != AssignmentStatus.ACTIVE or assignment.assigned_user_id != request.from_user_id:
+        request.status = TransferStatus.EXPIRED
+        request.resolved_at = utc_now()
+        await session.commit()
+        raise DomainError("Bu navbat endi faol emas.")
+    request.status = TransferStatus.ACCEPTED if accepted else TransferStatus.REJECTED
+    request.resolved_at = utc_now()
+    if accepted:
+        assignment.assigned_user_id = recipient_user_id
+    await session.commit()
+    return request, assignment
+
+
+async def reassign_today(session: AsyncSession, assignment: FoodAssignment, user_id: int) -> None:
+    if assignment.status != AssignmentStatus.ACTIVE or not await is_queue_member(session, user_id):
+        raise DomainError("Faol navbatdagi foydalanuvchini tanlang.")
+    if await session.scalar(select(CompletionPoll.id).where(CompletionPoll.assignment_id == assignment.id)):
+        raise DomainError("Kechki tekshiruv boshlanganidan keyin navbatchini almashtirib bo‘lmaydi.")
+    assignment.assigned_user_id = user_id
+    pending_requests = await session.scalars(
+        select(TransferRequest).where(
+            TransferRequest.assignment_id == assignment.id, TransferRequest.status == TransferStatus.PENDING
+        )
+    )
+    for request in pending_requests:
+        request.status = TransferStatus.EXPIRED
+        request.resolved_at = utc_now()
+    await session.commit()
+
+
+async def claim_notification(
+    session: AsyncSession, assignment_id: int, kind: NotificationKind, recipient_user_id: int
+) -> bool:
+    log = await session.scalar(
+        select(NotificationLog).where(
+            NotificationLog.assignment_id == assignment_id,
+            NotificationLog.kind == kind,
+            NotificationLog.recipient_user_id == recipient_user_id,
+        )
+    )
+    if log and log.sent_at:
+        return False
+    if log and (log.is_terminal or (log.next_attempt_at and log.next_attempt_at > utc_now())):
+        return False
+    if log is None:
+        session.add(NotificationLog(assignment_id=assignment_id, kind=kind, recipient_user_id=recipient_user_id))
+        await session.commit()
+    return True
+
+
+async def finish_notification(
+    session: AsyncSession,
+    assignment_id: int,
+    kind: NotificationKind,
+    recipient_user_id: int,
+    error: str | None = None,
+    terminal: bool = False,
+) -> None:
+    log = await session.scalar(
+        select(NotificationLog).where(
+            NotificationLog.assignment_id == assignment_id,
+            NotificationLog.kind == kind,
+            NotificationLog.recipient_user_id == recipient_user_id,
+        )
+    )
+    if log is None:
+        return
+    log.sent_at = None if error else utc_now()
+    log.error = error
+    if error:
+        log.attempts += 1
+        log.is_terminal = terminal
+        delay_minutes = min(5 * log.attempts, 60)
+        log.next_attempt_at = utc_now() + timedelta(minutes=delay_minutes)
+    else:
+        log.next_attempt_at = None
+    await session.commit()

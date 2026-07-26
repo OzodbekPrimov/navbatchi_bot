@@ -1,0 +1,139 @@
+<component name="InspectionProjectProfileManager">
+  <profile version="1.0">
+    <option name="myName" value="Project Default" />
+    <inspection_tool class="LossyEncoding" enabled="true" level="INFORMATION" enabled_by_default="true" />
+    <inspection_tool class="PyPackageRequirementsInspection" enabled="true" level="WARNING" enabled_by_default="true">
+      <option name="ignoredPackages">
+        <list>
+          <option value="amqp" />
+          <option value="asgiref" />
+          <option value="attrs" />
+          <option value="billiard" />
+          <option value="celery" />
+          <option value="click" />
+          <option value="click-didyoumean" />
+          <option value="click-plugins" />
+          <option value="click-repl" />
+          <option value="cron_descriptor" />
+          <option value="Django" />
+          <option value="django-celery-beat" />
+          <option value="django-timezone-field" />
+          <option value="djangorestframework" />
+          <option value="djangorestframework_simplejwt" />
+          <option value="drf-spectacular" />
+          <option value="environs" />
+          <option value="et_xmlfile" />
+          <option value="inflection" />
+          <option value="jsonschema" />
+          <option value="jsonschema-specifications" />
+          <option value="kombu" />
+          <option value="marshmallow" />
+          <option value="openpyxl" />
+          <option value="packaging" />
+          <option value="pillow" />
+          <option value="prompt_toolkit" />
+          <option value="psycopg2-binary" />
+          <option value="PyJWT" />
+          <option value="python-crontab" />
+          <option value="python-dateutil" />
+          <option value="python-dotenv" />
+          <option value="PyYAML" />
+          <option value="redis" />
+          <option value="referencing" />
+          <option value="rpds-py" />
+          <option value="six" />
+          <option value="sqlparse" />
+          <option value="typing_extensions" />
+          <option value="tzdata" />
+          <option value="tzlocal" />
+          <option value="uritemplate" />
+          <option value="vine" />
+          <option value="wcwidth" />
+          <option value="django-stubs" />
+          <option value="django-stubs-ext" />
+          <option value="djangorestframework-stubs" />
+          <option value="types-PyYAML" />
+          <option value="anyio" />
+          <option value="CacheControl" />
+          <option value="certifi" />
+          <option value="cffi" />
+          <option value="charset-normalizer" />
+          <option value="cryptography" />
+          <option value="django-cors-headers" />
+          <option value="django-filter" />
+          <option value="django-jazzmin" />
+          <option value="django-modeltranslation" />
+          <option value="drf-yasg" />
+          <option value="exceptiongroup" />
+          <option value="firebase-admin" />
+          <option value="google-api-core" />
+          <option value="google-api-python-client" />
+          <option value="google-auth" />
+          <option value="google-auth-httplib2" />
+          <option value="google-cloud-core" />
+          <option value="google-cloud-firestore" />
+          <option value="google-cloud-storage" />
+          <option value="google-crc32c" />
+          <option value="google-resumable-media" />
+          <option value="googleapis-common-protos" />
+          <option value="grpcio" />
+          <option value="grpcio-status" />
+          <option value="h11" />
+          <option value="h2" />
+          <option value="hpack" />
+          <option value="httpcore" />
+          <option value="httplib2" />
+          <option value="httpx" />
+          <option value="hyperframe" />
+          <option value="idna" />
+          <option value="iniconfig" />
+          <option value="msgpack" />
+          <option value="phonenumbers" />
+          <option value="pluggy" />
+          <option value="proto-plus" />
+          <option value="protobuf" />
+          <option value="pyasn1" />
+          <option value="pyasn1_modules" />
+          <option value="pycparser" />
+          <option value="Pygments" />
+          <option value="pyparsing" />
+          <option value="pytest" />
+          <option value="pytest-django" />
+          <option value="python-decouple" />
+          <option value="pytz" />
+          <option value="requests" />
+          <option value="rsa" />
+          <option value="urllib3" />
+          <option value="django-encrypted-model-fields" />
+          <option value="annotated-doc" />
+          <option value="annotated-types" />
+          <option value="fastapi" />
+          <option value="pydantic" />
+          <option value="pydantic_core" />
+          <option value="starlette" />
+          <option value="typing-inspection" />
+          <option value="colorama" />
+          <option value="httptools" />
+          <option value="uvicorn" />
+          <option value="watchfiles" />
+          <option value="websockets" />
+          <option value="gunicorn" />
+        </list>
+      </option>
+    </inspection_tool>
+    <inspection_tool class="PyStubPackagesAdvertiser" enabled="true" level="WARNING" enabled_by_default="true">
+      <option name="ignoredPackages">
+        <list>
+          <option value="djangorestframework" />
+        </list>
+      </option>
+    </inspection_tool>
+    <inspection_tool class="PyUnresolvedReferencesInspection" enabled="true" level="WARNING" enabled_by_default="true">
+      <option name="ignoredIdentifiers">
+        <list>
+          <option value="list.*" />
+        </list>
+      </option>
+    </inspection_tool>
+  </profile>
+</component>
