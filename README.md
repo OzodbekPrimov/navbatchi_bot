@@ -13,7 +13,7 @@ Aiogram 3 bot
    └── PostgreSQL: navbat, kunlik vazifa, so‘rov, ovoz va xabar loglari
 ```
 
-Bot bitta process bo‘lib ishlaydi. Scheduler xabar yuborilganini `notification_logs` jadvaliga yozadi; shu sababli restart yoki bir tugmani qayta bosish navbatni takror siljitmaydi. Ushbu MVP’da faqat **bitta xona va ovqat navbati** bor.
+Bot bitta process bo‘lib ishlaydi. Scheduler xabar yuborilganini bazada qayd qiladi; shu sababli restart yoki bir tugmani qayta bosish navbatni takror siljitmaydi. Ushbu MVP bitta xona uchun ovqat, non va suv navbatlarini boshqaradi.
 
 ## Biznes qoidalari
 
@@ -30,6 +30,18 @@ Bot bitta process bo‘lib ishlaydi. Scheduler xabar yuborilganini `notification
   - ovoz ham, navbatchining tasdig‘i ham bo‘lmasa — ertaga yana o‘sha odam va admin ogohlantiriladi.
 - Har odam bitta ovozga ega; tugmani qayta bosib o‘z ovozini o‘zgartirishi mumkin.
 - Transfer faqat bugungi vazifani o‘zgartiradi. Doimiy navbat tartibi o‘zgarmaydi.
+
+### Non va suv navbati
+
+- Non va suv alohida, kunlik bo‘lmagan navbatlardir.
+- Admin har biri uchun alohida qatnashchilar va boshlang‘ich/keyingi odamni belgilaydi.
+- Xonadosh `🥖 Non tugadi` yoki `💧 Suv tugadi` ni tasdiqlasa, bot faqat bitta ochiq vazifa yaratadi.
+- Navbatchi guruhda mention qilinadi va shaxsiy chatida `Olib keldim` hamda `Navbatni o‘tkazish` tugmalarini oladi.
+- `Olib keldim` bosilgach, qolgan faol xonadoshlarga 30 daqiqalik `Ha / Yo‘q` tekshiruv yuboriladi.
+  - 2 ta `Yo‘q` — vazifa o‘sha odamda qoladi;
+  - kamida 1 ta `Ha` va 2 tadan kam `Yo‘q` — navbat keyingi odamga siljiydi;
+  - ovoz bo‘lmasa — `Olib keldim` tasdig‘i asosida navbat siljiydi.
+- Transfer faqat tekshiruv boshlanishidan oldin mumkin. Qabul qilinsa, eski va yangi navbatchi shaxsiy xabar oladi, guruhda ikkalasi mention bilan e’lon qilinadi. So‘rov 15 daqiqada qabul qilinmasa avtomatik bekor bo‘ladi.
 
 ## Ishga tushirish
 
@@ -61,6 +73,13 @@ Guruh e’lonlari va o‘zgarishlar bazada alohida loglanadi. Shu sabab server r
 3. Admin `👥 Qatnashchilar` menyusidan kerakli odamlarni qo‘shadi.
 4. Admin `↕️ Navbat tartibi` orqali ketma-ketlikni tuzadi.
 5. Admin `▶️ Navbatni boshlash` orqali bugungi odamni tanlaydi.
+6. Admin `📦 Non va suv navbati` orqali non va suv qatnashchilarini qo‘shadi, tartibini tuzadi va har biri uchun keyingi navbatchini tanlaydi.
+
+## Kundalik foydalanish
+
+- `📋 Bugungi holat` — ovqatning bugungi odami, non/suvning faol vazifasi yoki keyingi odamini ko‘rsatadi.
+- `📌 Mening navbatlarim` — foydalanuvchining ovqat vazifasi va non/suvdagi navbat o‘rnini ko‘rsatadi; faol vazifa bo‘lsa kerakli tugmalar ham chiqadi.
+- `⚙️ Admin → 📊 Umumiy holat` — uchala navbatning bitta ekrandagi holati.
 
 ## Loyihadagi muhim qismlar
 

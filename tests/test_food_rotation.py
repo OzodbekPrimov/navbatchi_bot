@@ -9,17 +9,34 @@ os.environ.setdefault("BOT_TOKEN", "test-token")
 os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite://")
 
 from app.database import Base
-from app.models import AssignmentStatus, GroupNotificationKind, GroupNotificationLog, User, VoteValue
+from app.models import (
+    AssignmentStatus,
+    GroupNotificationKind,
+    GroupNotificationLog,
+    SupplyRotationState,
+    SupplyTaskStatus,
+    SupplyType,
+    User,
+    VoteValue,
+)
 from app.services import (
+    add_supply_queue_member,
     add_queue_member,
+    cast_supply_vote,
     cast_vote,
     confirm_food_prepared,
     create_completion_poll,
     create_initial_assignment,
+    create_supply_transfer,
+    decide_supply_transfer,
+    open_supply_task,
+    report_supply_brought,
     enqueue_group_notification,
     get_assignment_for_date,
     reassign_today,
     resolve_poll,
+    resolve_supply_poll,
+    set_supply_current_user,
     set_active_room,
 )
 
@@ -133,3 +150,63 @@ async def test_group_notifications_are_idempotent_and_follow_reassignment(sessio
         (GroupNotificationKind.DAILY_DUTY, first.id, 0),
         (GroupNotificationKind.DUTY_CHANGED, second.id, 1),
     ]
+
+
+@pytest.mark.asyncio
+async def test_supply_task_advances_only_after_delivery_verification(session):
+    first, second, third = await add_people(session, 3)
+    for person in (first, second, third):
+        await add_supply_queue_member(session, SupplyType.BREAD, person.id)
+    await set_supply_current_user(session, SupplyType.BREAD, first.id)
+
+    task = await open_supply_task(session, SupplyType.BREAD, second.id)
+    poll = await report_supply_brought(session, task.id, first.id)
+    await cast_supply_vote(session, poll.id, second.id, VoteValue.YES, now=poll.closes_at - timedelta(seconds=1))
+    assert await resolve_supply_poll(session, poll, now=poll.closes_at + timedelta(seconds=1)) is True
+
+    state = await session.get(SupplyRotationState, SupplyType.BREAD)
+    assert task.status == SupplyTaskStatus.COMPLETED
+    assert state is not None
+    assert state.current_user_id == second.id
+
+
+@pytest.mark.asyncio
+async def test_two_supply_no_votes_keep_the_same_task_open(session):
+    first, second, third = await add_people(session, 3)
+    for person in (first, second, third):
+        await add_supply_queue_member(session, SupplyType.WATER, person.id)
+    await set_supply_current_user(session, SupplyType.WATER, first.id)
+
+    task = await open_supply_task(session, SupplyType.WATER, second.id)
+    poll = await report_supply_brought(session, task.id, first.id)
+    before_close = poll.closes_at - timedelta(seconds=1)
+    await cast_supply_vote(session, poll.id, second.id, VoteValue.NO, now=before_close)
+    await cast_supply_vote(session, poll.id, third.id, VoteValue.NO, now=before_close)
+    assert await resolve_supply_poll(session, poll, now=poll.closes_at + timedelta(seconds=1)) is False
+
+    state = await session.get(SupplyRotationState, SupplyType.WATER)
+    assert task.status == SupplyTaskStatus.AWAITING_DELIVERY
+    assert state is not None
+    assert state.current_user_id == first.id
+
+
+@pytest.mark.asyncio
+async def test_supply_transfer_advances_after_the_effective_delivery_person(session):
+    first, second, third = await add_people(session, 3)
+    for person in (first, second, third):
+        await add_supply_queue_member(session, SupplyType.BREAD, person.id)
+    await set_supply_current_user(session, SupplyType.BREAD, first.id)
+    task = await open_supply_task(session, SupplyType.BREAD, third.id)
+
+    request = await create_supply_transfer(session, task.id, first.id, second.id)
+    _, task = await decide_supply_transfer(session, request.id, second.id, accepted=True)
+    assert task.scheduled_user_id == first.id
+    assert task.assigned_user_id == second.id
+
+    poll = await report_supply_brought(session, task.id, second.id)
+    await cast_supply_vote(session, poll.id, third.id, VoteValue.YES, now=poll.closes_at - timedelta(seconds=1))
+    assert await resolve_supply_poll(session, poll, now=poll.closes_at + timedelta(seconds=1)) is True
+
+    state = await session.get(SupplyRotationState, SupplyType.BREAD)
+    assert state is not None
+    assert state.current_user_id == third.id

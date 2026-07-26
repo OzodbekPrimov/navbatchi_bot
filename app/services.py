@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import UTC, date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import Select, func, select
+from sqlalchemy import Select, delete, func, select, union
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import (
@@ -18,6 +18,19 @@ from app.models import (
     PollStatus,
     PollVote,
     RoomSetting,
+    SupplyActiveTask,
+    SupplyNotificationKind,
+    SupplyNotificationLog,
+    SupplyPollStatus,
+    SupplyPollVote,
+    SupplyQueueMember,
+    SupplyRotationState,
+    SupplyTask,
+    SupplyTaskStatus,
+    SupplyTransferRequest,
+    SupplyTransferStatus,
+    SupplyType,
+    SupplyVerificationPoll,
     TransferRequest,
     TransferStatus,
     User,
@@ -251,6 +264,356 @@ async def enqueue_group_notification(
     session.add(log)
     await session.flush()
     return log
+
+
+async def active_supply_queue(session: AsyncSession, supply_type: SupplyType) -> list[tuple[SupplyQueueMember, User]]:
+    result = await session.execute(
+        select(SupplyQueueMember, User)
+        .join(User, User.id == SupplyQueueMember.user_id)
+        .where(SupplyQueueMember.supply_type == supply_type, SupplyQueueMember.is_active.is_(True))
+        .order_by(SupplyQueueMember.position)
+    )
+    return list(result.all())
+
+
+async def is_supply_queue_member(session: AsyncSession, supply_type: SupplyType, user_id: int) -> bool:
+    return bool(
+        await session.scalar(
+            select(SupplyQueueMember.id).where(
+                SupplyQueueMember.supply_type == supply_type,
+                SupplyQueueMember.user_id == user_id,
+                SupplyQueueMember.is_active.is_(True),
+            )
+        )
+    )
+
+
+async def add_supply_queue_member(session: AsyncSession, supply_type: SupplyType, user_id: int) -> None:
+    if await is_supply_queue_member(session, supply_type, user_id):
+        raise DomainError("Bu foydalanuvchi ushbu navbatda bor.")
+    member = await session.scalar(
+        select(SupplyQueueMember).where(
+            SupplyQueueMember.supply_type == supply_type, SupplyQueueMember.user_id == user_id
+        )
+    )
+    last_position = await session.scalar(
+        select(func.max(SupplyQueueMember.position)).where(
+            SupplyQueueMember.supply_type == supply_type, SupplyQueueMember.is_active.is_(True)
+        )
+    ) or 0
+    if member is None:
+        session.add(SupplyQueueMember(supply_type=supply_type, user_id=user_id, position=last_position + 1))
+    else:
+        member.is_active = True
+        member.position = last_position + 1
+    await session.commit()
+
+
+async def remove_supply_queue_member(session: AsyncSession, supply_type: SupplyType, user_id: int) -> None:
+    member = await session.scalar(
+        select(SupplyQueueMember).where(
+            SupplyQueueMember.supply_type == supply_type,
+            SupplyQueueMember.user_id == user_id,
+            SupplyQueueMember.is_active.is_(True),
+        )
+    )
+    if member is None:
+        raise DomainError("Bu foydalanuvchi ushbu navbatda yo‘q.")
+    active_task = await session.get(SupplyActiveTask, supply_type)
+    if active_task:
+        task = await session.get(SupplyTask, active_task.task_id)
+        if task and user_id in {task.scheduled_user_id, task.assigned_user_id}:
+            raise DomainError("Ochiq vazifadagi odamni avval almashtiring.")
+    state = await session.get(SupplyRotationState, supply_type)
+    if state and state.current_user_id == user_id:
+        raise DomainError("Avval keyingi navbatchini belgilang.")
+    member.is_active = False
+    member.position = -member.id
+    await session.commit()
+
+
+async def move_supply_queue_member(
+    session: AsyncSession, supply_type: SupplyType, user_id: int, direction: int
+) -> None:
+    entries = await active_supply_queue(session, supply_type)
+    index = next((i for i, (member, _) in enumerate(entries) if member.user_id == user_id), None)
+    if index is None:
+        raise DomainError("Foydalanuvchi ushbu navbatda yo‘q.")
+    other_index = index + direction
+    if other_index < 0 or other_index >= len(entries):
+        return
+    entries[index], entries[other_index] = entries[other_index], entries[index]
+    for member, _ in entries:
+        member.position = -(20_000 + member.id)
+    await session.flush()
+    for position, (member, _) in enumerate(entries, start=1):
+        member.position = position
+    await session.commit()
+
+
+async def set_supply_current_user(session: AsyncSession, supply_type: SupplyType, user_id: int) -> None:
+    if not await is_supply_queue_member(session, supply_type, user_id):
+        raise DomainError("Keyingi navbatchi ushbu navbatda bo‘lishi kerak.")
+    if await session.get(SupplyActiveTask, supply_type):
+        raise DomainError("Ochiq vazifa bor. Uni yakunlang yoki transfer qiling.")
+    state = await session.get(SupplyRotationState, supply_type, with_for_update=True)
+    if state is None:
+        session.add(SupplyRotationState(supply_type=supply_type, current_user_id=user_id))
+    else:
+        state.current_user_id = user_id
+    await session.commit()
+
+
+async def _next_supply_user(session: AsyncSession, supply_type: SupplyType, user_id: int) -> int:
+    current = await session.scalar(
+        select(SupplyQueueMember).where(
+            SupplyQueueMember.supply_type == supply_type, SupplyQueueMember.user_id == user_id
+        )
+    )
+    entries = await active_supply_queue(session, supply_type)
+    if not entries:
+        raise DomainError("Navbat bo‘sh.")
+    if current:
+        for member, _ in entries:
+            if member.position > current.position:
+                return member.user_id
+    return entries[0][0].user_id
+
+
+async def _is_active_room_user(session: AsyncSession, user_id: int) -> bool:
+    active_user_ids = union(
+        select(FoodQueueMember.user_id).where(FoodQueueMember.is_active.is_(True)),
+        select(SupplyQueueMember.user_id).where(SupplyQueueMember.is_active.is_(True)),
+    )
+    return bool(await session.scalar(select(User.id).where(User.id == user_id, User.id.in_(active_user_ids))))
+
+
+async def active_room_users(session: AsyncSession) -> list[User]:
+    active_user_ids = union(
+        select(FoodQueueMember.user_id).where(FoodQueueMember.is_active.is_(True)),
+        select(SupplyQueueMember.user_id).where(SupplyQueueMember.is_active.is_(True)),
+    )
+    return list((await session.scalars(select(User).where(User.id.in_(active_user_ids)).order_by(User.full_name))).all())
+
+
+async def open_supply_task(session: AsyncSession, supply_type: SupplyType, requester_user_id: int) -> SupplyTask:
+    if not await _is_active_room_user(session, requester_user_id):
+        raise DomainError("Faqat faol xonadosh bu vazifani ochishi mumkin.")
+    state = await session.get(SupplyRotationState, supply_type, with_for_update=True)
+    if state is None:
+        raise DomainError("Admin avval bu navbat uchun birinchi odamni tanlashi kerak.")
+    if await session.get(SupplyActiveTask, supply_type, with_for_update=True):
+        raise DomainError("Bu tur uchun allaqachon ochiq vazifa bor.")
+    task = SupplyTask(
+        supply_type=supply_type,
+        requester_user_id=requester_user_id,
+        scheduled_user_id=state.current_user_id,
+        assigned_user_id=state.current_user_id,
+    )
+    session.add(task)
+    await session.flush()
+    session.add(SupplyActiveTask(supply_type=supply_type, task_id=task.id))
+    await session.commit()
+    return task
+
+
+async def report_supply_brought(
+    session: AsyncSession, task_id: int, user_id: int, now: datetime | None = None
+) -> SupplyVerificationPoll:
+    now = now or utc_now()
+    task = await session.scalar(select(SupplyTask).where(SupplyTask.id == task_id).with_for_update())
+    if task is None or task.status != SupplyTaskStatus.AWAITING_DELIVERY:
+        raise DomainError("Bu vazifa hozir tasdiqlashga tayyor emas.")
+    if task.assigned_user_id != user_id:
+        raise DomainError("Faqat hozirgi navbatchi bu tugmani bosa oladi.")
+    attempt = await session.scalar(
+        select(func.max(SupplyVerificationPoll.attempt)).where(SupplyVerificationPoll.task_id == task.id)
+    ) or 0
+    poll = SupplyVerificationPoll(task_id=task.id, attempt=attempt + 1, closes_at=now + timedelta(minutes=30))
+    task.status = SupplyTaskStatus.VERIFYING
+    session.add(poll)
+    await session.commit()
+    return poll
+
+
+async def cast_supply_vote(
+    session: AsyncSession, poll_id: int, voter_user_id: int, value: VoteValue, now: datetime | None = None
+) -> None:
+    now = now or utc_now()
+    poll = await session.get(SupplyVerificationPoll, poll_id)
+    if poll is None or poll.status != SupplyPollStatus.OPEN or poll.closes_at <= now:
+        raise DomainError("Bu so‘rovnoma yopilgan.")
+    task = await session.get(SupplyTask, poll.task_id)
+    if task is None or task.assigned_user_id == voter_user_id or not await _is_active_room_user(session, voter_user_id):
+        raise DomainError("Bu so‘rovnomada ovoz bera olmaysiz.")
+    vote = await session.scalar(
+        select(SupplyPollVote).where(
+            SupplyPollVote.poll_id == poll_id, SupplyPollVote.voter_user_id == voter_user_id
+        )
+    )
+    if vote is None:
+        session.add(SupplyPollVote(poll_id=poll_id, voter_user_id=voter_user_id, value=value))
+    else:
+        vote.value = value
+        vote.updated_at = now
+    await session.commit()
+
+
+async def resolve_supply_poll(session: AsyncSession, poll: SupplyVerificationPoll, now: datetime | None = None) -> bool:
+    now = now or utc_now()
+    poll = await session.scalar(
+        select(SupplyVerificationPoll).where(SupplyVerificationPoll.id == poll.id).with_for_update()
+    )
+    assert poll is not None
+    if poll.status == SupplyPollStatus.CLOSED:
+        task = await session.get(SupplyTask, poll.task_id)
+        return bool(task and task.status == SupplyTaskStatus.COMPLETED)
+    if poll.closes_at > now:
+        raise DomainError("So‘rovnoma hali yopilmagan.")
+    task = await session.scalar(select(SupplyTask).where(SupplyTask.id == poll.task_id).with_for_update())
+    assert task is not None
+    no_votes = await session.scalar(
+        select(func.count(SupplyPollVote.id)).where(
+            SupplyPollVote.poll_id == poll.id, SupplyPollVote.value == VoteValue.NO
+        )
+    ) or 0
+    yes_votes = await session.scalar(
+        select(func.count(SupplyPollVote.id)).where(
+            SupplyPollVote.poll_id == poll.id, SupplyPollVote.value == VoteValue.YES
+        )
+    ) or 0
+    passed = no_votes < 2 and (yes_votes > 0 or no_votes == 0)
+    poll.status = SupplyPollStatus.CLOSED
+    if passed:
+        state = await session.get(SupplyRotationState, task.supply_type, with_for_update=True)
+        assert state is not None
+        # A person who accepted a supply transfer has completed this turn, so the
+        # next supply turn starts after the effective delivery person.
+        state.current_user_id = await _next_supply_user(session, task.supply_type, task.assigned_user_id)
+        task.status = SupplyTaskStatus.COMPLETED
+        task.completed_at = now
+        await session.execute(delete(SupplyActiveTask).where(SupplyActiveTask.supply_type == task.supply_type))
+    else:
+        task.status = SupplyTaskStatus.AWAITING_DELIVERY
+    await session.commit()
+    return passed
+
+
+async def create_supply_transfer(session: AsyncSession, task_id: int, from_user_id: int, to_user_id: int) -> SupplyTransferRequest:
+    task = await session.scalar(select(SupplyTask).where(SupplyTask.id == task_id).with_for_update())
+    if task is None or task.status != SupplyTaskStatus.AWAITING_DELIVERY or task.assigned_user_id != from_user_id:
+        raise DomainError("Bu vazifani hozir o‘tkaza olmaysiz.")
+    if from_user_id == to_user_id or not await is_supply_queue_member(session, task.supply_type, to_user_id):
+        raise DomainError("Shu navbatdagi boshqa faol xonadoshni tanlang.")
+    pending = await session.scalar(
+        select(SupplyTransferRequest.id).where(
+            SupplyTransferRequest.task_id == task.id, SupplyTransferRequest.status == SupplyTransferStatus.PENDING
+        )
+    )
+    if pending:
+        raise DomainError("Bu vazifa uchun transfer javobi kutilmoqda.")
+    request = SupplyTransferRequest(task_id=task.id, from_user_id=from_user_id, to_user_id=to_user_id)
+    session.add(request)
+    await session.commit()
+    return request
+
+
+async def decide_supply_transfer(
+    session: AsyncSession, request_id: int, recipient_user_id: int, accepted: bool
+) -> tuple[SupplyTransferRequest, SupplyTask]:
+    request = await session.scalar(
+        select(SupplyTransferRequest).where(SupplyTransferRequest.id == request_id).with_for_update()
+    )
+    if request is None or request.to_user_id != recipient_user_id or request.status != SupplyTransferStatus.PENDING:
+        raise DomainError("Bu transfer so‘rovi faol emas yoki sizga tegishli emas.")
+    task = await session.scalar(select(SupplyTask).where(SupplyTask.id == request.task_id).with_for_update())
+    assert task is not None
+    if task.status != SupplyTaskStatus.AWAITING_DELIVERY or task.assigned_user_id != request.from_user_id:
+        request.status = SupplyTransferStatus.EXPIRED
+        request.resolved_at = utc_now()
+        await session.commit()
+        raise DomainError("Bu vazifa endi transfer qilinmaydi.")
+    request.status = SupplyTransferStatus.ACCEPTED if accepted else SupplyTransferStatus.REJECTED
+    request.resolved_at = utc_now()
+    if accepted:
+        task.previous_assignee_user_id = task.assigned_user_id
+        task.assigned_user_id = recipient_user_id
+        task.notification_revision += 1
+    await session.commit()
+    return request, task
+
+
+async def expire_supply_transfers(
+    session: AsyncSession, now: datetime | None = None
+) -> list[SupplyTransferRequest]:
+    now = now or utc_now()
+    requests = list(
+        (
+            await session.scalars(
+                select(SupplyTransferRequest)
+                .where(
+                    SupplyTransferRequest.status == SupplyTransferStatus.PENDING,
+                    SupplyTransferRequest.created_at <= now - timedelta(minutes=15),
+                )
+                .with_for_update()
+            )
+        ).all()
+    )
+    for request in requests:
+        request.status = SupplyTransferStatus.EXPIRED
+        request.resolved_at = now
+    if requests:
+        await session.commit()
+    return requests
+
+
+async def claim_supply_notification(
+    session: AsyncSession,
+    task_id: int,
+    kind: SupplyNotificationKind,
+    event_key: str,
+    target_key: str,
+    recipient_user_id: int | None = None,
+    chat_id: int | None = None,
+    poll_id: int | None = None,
+) -> SupplyNotificationLog | None:
+    log = await session.scalar(
+        select(SupplyNotificationLog).where(
+            SupplyNotificationLog.task_id == task_id,
+            SupplyNotificationLog.event_key == event_key,
+            SupplyNotificationLog.target_key == target_key,
+        )
+    )
+    if log and (log.sent_at or log.is_terminal or (log.next_attempt_at and log.next_attempt_at > utc_now())):
+        return None
+    if log is None:
+        log = SupplyNotificationLog(
+            task_id=task_id,
+            poll_id=poll_id,
+            kind=kind,
+            event_key=event_key,
+            target_key=target_key,
+            recipient_user_id=recipient_user_id,
+            chat_id=chat_id,
+        )
+        session.add(log)
+        await session.commit()
+    return log
+
+
+async def finish_supply_notification(
+    session: AsyncSession, log: SupplyNotificationLog, error: str | None = None, terminal: bool = False
+) -> None:
+    if error:
+        log.error = error
+        log.attempts += 1
+        log.is_terminal = terminal
+        log.next_attempt_at = utc_now() + timedelta(minutes=min(5 * log.attempts, 60))
+    else:
+        log.sent_at = utc_now()
+        log.error = None
+        log.next_attempt_at = None
+    await session.commit()
 
 
 async def create_completion_poll(

@@ -20,19 +20,31 @@ from app.models import (
     GroupNotificationKind,
     NotificationKind,
     PollStatus,
+    SupplyNotificationKind,
+    SupplyPollStatus,
+    SupplyTask,
+    SupplyTaskStatus,
+    SupplyType,
+    SupplyVerificationPoll,
     User,
 )
 from app.services import (
     active_queue,
+    active_room,
+    active_room_users,
+    claim_supply_notification,
     claim_notification,
     create_completion_poll,
     current_assignment,
     enqueue_group_notification,
+    expire_supply_transfers,
     finish_group_notification,
     finish_notification,
+    finish_supply_notification,
     pending_group_notifications,
     poll_has_no_activity,
     resolve_poll,
+    resolve_supply_poll,
     utc_now,
 )
 
@@ -97,6 +109,10 @@ class DutyScheduler:
             await self._send_no_activity_alert(assignment_id)
         await self._queue_daily_group_announcement(local_now)
         await self._send_pending_group_notifications()
+        await self._expire_supply_transfers(now)
+        await self._resolve_expired_supply_polls(now)
+        await self._send_supply_task_notifications()
+        await self._send_supply_poll_messages(now)
         await self._send_open_poll_messages(now)
         await self._send_due_reminders(local_now)
 
@@ -212,6 +228,170 @@ class DutyScheduler:
                     await finish_group_notification(session, log)
         for assignment_id in failed_assignment_ids:
             await self._send_group_error_alert(assignment_id)
+
+    @staticmethod
+    def _supply_label(supply_type: SupplyType) -> str:
+        return "Non" if supply_type == SupplyType.BREAD else "Suv"
+
+    async def _resolve_expired_supply_polls(self, now: datetime) -> None:
+        async with SessionFactory() as session:
+            polls = list(
+                (
+                    await session.scalars(
+                        select(SupplyVerificationPoll).where(
+                            SupplyVerificationPoll.status == SupplyPollStatus.OPEN,
+                            SupplyVerificationPoll.closes_at <= now,
+                        )
+                    )
+                ).all()
+            )
+            for poll in polls:
+                await resolve_supply_poll(session, poll, now)
+
+    async def _expire_supply_transfers(self, now: datetime) -> None:
+        async with SessionFactory() as session:
+            requests = await expire_supply_transfers(session, now)
+            senders = [await session.get(User, request.from_user_id) for request in requests]
+        for sender in senders:
+            if sender is None:
+                continue
+            try:
+                await self.bot.send_message(
+                    sender.telegram_id,
+                    "Ta’minot navbatini o‘tkazish so‘rovi 15 daqiqada qabul qilinmadi. Navbat sizda qoldi.",
+                )
+            except TelegramAPIError:
+                logger.warning("Could not send expired transfer notification to %s", sender.telegram_id)
+
+    async def _send_supply_task_notifications(self) -> None:
+        async with SessionFactory() as session:
+            tasks = list(
+                (
+                    await session.scalars(
+                        select(SupplyTask).where(
+                            SupplyTask.status.in_((SupplyTaskStatus.AWAITING_DELIVERY, SupplyTaskStatus.VERIFYING))
+                        )
+                    )
+                ).all()
+            )
+            room = await active_room(session)
+            for task in tasks:
+                assignee = await session.get(User, task.assigned_user_id)
+                if assignee is None:
+                    continue
+                label = self._supply_label(task.supply_type)
+                revision_key = f"assignment:{task.notification_revision}"
+                direct_log = await claim_supply_notification(
+                    session,
+                    task.id,
+                    SupplyNotificationKind.ASSIGNMENT_DIRECT,
+                    revision_key,
+                    f"dm:{assignee.id}",
+                    recipient_user_id=assignee.id,
+                )
+                if direct_log:
+                    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+                    markup = InlineKeyboardMarkup(
+                        inline_keyboard=[
+                            [InlineKeyboardButton(text="✅ Olib keldim", callback_data=f"supply:done:{task.id}")],
+                            [InlineKeyboardButton(text="🔄 Navbatni o‘tkazish", callback_data=f"supply:transfer:{task.id}")],
+                        ]
+                    )
+                    await self._send_supply_log(
+                        session,
+                        direct_log,
+                        assignee.telegram_id,
+                        f"{label} tugadi. Sizning navbatingiz — olib kelishingiz kerak.",
+                        reply_markup=markup,
+                    )
+                if room is None:
+                    continue
+                group_log = await claim_supply_notification(
+                    session,
+                    task.id,
+                    SupplyNotificationKind.ASSIGNMENT_GROUP,
+                    revision_key,
+                    f"group:{room.chat_id}",
+                    chat_id=room.chat_id,
+                )
+                if group_log:
+                    mention = f'<a href="tg://user?id={assignee.telegram_id}">{escape(assignee.full_name)}</a>'
+                    if task.notification_revision == 0:
+                        text = f"{label} tugadi. {mention}, sizning navbatingiz — olib kelishingiz kerak."
+                    else:
+                        previous = await session.get(User, task.previous_assignee_user_id)
+                        old_mention = (
+                            f'<a href="tg://user?id={previous.telegram_id}">{escape(previous.full_name)}</a>'
+                            if previous
+                            else "Oldingi navbatchi"
+                        )
+                        text = f"🔄 {label} navbati {old_mention} dan {mention} ga o‘tdi."
+                    await self._send_supply_log(session, group_log, room.chat_id, text, parse_mode=ParseMode.HTML)
+
+    async def _send_supply_poll_messages(self, now: datetime) -> None:
+        async with SessionFactory() as session:
+            polls = list(
+                (
+                    await session.scalars(
+                        select(SupplyVerificationPoll).where(
+                            SupplyVerificationPoll.status == SupplyPollStatus.OPEN,
+                            SupplyVerificationPoll.closes_at > now,
+                        )
+                    )
+                ).all()
+            )
+            voters = await active_room_users(session)
+            for poll in polls:
+                task = await session.get(SupplyTask, poll.task_id)
+                if task is None:
+                    continue
+                assignee = await session.get(User, task.assigned_user_id)
+                if assignee is None:
+                    continue
+                label = self._supply_label(task.supply_type)
+                for voter in voters:
+                    if voter.id == assignee.id:
+                        continue
+                    log = await claim_supply_notification(
+                        session,
+                        task.id,
+                        SupplyNotificationKind.POLL,
+                        f"poll:{poll.id}",
+                        f"dm:{voter.id}",
+                        recipient_user_id=voter.id,
+                        poll_id=poll.id,
+                    )
+                    if log is None:
+                        continue
+                    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+                    markup = InlineKeyboardMarkup(
+                        inline_keyboard=[
+                            [
+                                InlineKeyboardButton(text="✅ Ha", callback_data=f"supplyvote:{poll.id}:yes"),
+                                InlineKeyboardButton(text="❌ Yo‘q", callback_data=f"supplyvote:{poll.id}:no"),
+                            ]
+                        ]
+                    )
+                    await self._send_supply_log(
+                        session,
+                        log,
+                        voter.telegram_id,
+                        f"{assignee.full_name} {label.lower()} olib keldimi? Ovoz 30 daqiqada yopiladi.",
+                        reply_markup=markup,
+                    )
+
+    async def _send_supply_log(self, session, log, chat_id: int, text: str, reply_markup=None, parse_mode=None) -> None:
+        try:
+            await self.bot.send_message(chat_id, text, reply_markup=reply_markup, parse_mode=parse_mode)
+        except TelegramForbiddenError as error:
+            await finish_supply_notification(session, log, str(error), terminal=True)
+        except TelegramAPIError as error:
+            await finish_supply_notification(session, log, str(error))
+            logger.warning("Could not send supply notification to %s: %s", chat_id, error)
+        else:
+            await finish_supply_notification(session, log)
 
     async def _send_no_activity_alert(self, assignment_id: int) -> None:
         async with SessionFactory() as session:
