@@ -19,12 +19,14 @@ Bot bitta process bo‘lib ishlaydi. Scheduler xabar yuborilganini `notification
 
 - Admin ovqat navbati ketma-ketligini boshqaradi.
 - Admin navbatni boshlaganda bugungi birinchi navbatchini tanlaydi.
-- Navbatchiga Toshkent vaqti bilan 07:00, 12:00 va 19:00 da xabar yuboriladi.
-- 23:59 da navbatchidan tashqari faol qatnashchilarga tekshiruv yuboriladi.
-- Ovoz berish 00:15 da yopiladi:
+- Navbatchiga Toshkent vaqti bilan 07:00, 12:00 va 19:00 da xabar yuboriladi. Bot vaqtincha to‘xtagan bo‘lsa, qaytganda faqat eng so‘nggi o‘tkazib yuborilgan eslatmani yuboradi.
+- Navbatchi `Ovqat tayyorladim` tugmasi bilan bajarganini qayd qilishi mumkin; bu yakuniy ovoz o‘rnini bosmaydi.
+- 22:00 da navbatchidan tashqari faol qatnashchilarga tekshiruv yuboriladi.
+- Ovoz berish 23:59 da yopiladi:
   - kamida 2 ta `Yo‘q` — ertaga ham o‘sha rejalashtirilgan navbatchi;
   - 2 tadan kam `Yo‘q` va kamida 1 ta `Ha` — ertaga keyingi odam;
-  - ovoz bo‘lmasa — ertaga yana o‘sha odam.
+  - ovoz bo‘lmasa, lekin navbatchi tayyorlaganini tasdiqlagan bo‘lsa — ertaga keyingi odam;
+  - ovoz ham, navbatchining tasdig‘i ham bo‘lmasa — ertaga yana o‘sha odam va admin ogohlantiriladi.
 - Har odam bitta ovozga ega; tugmani qayta bosib o‘z ovozini o‘zgartirishi mumkin.
 - Transfer faqat bugungi vazifani o‘zgartiradi. Doimiy navbat tartibi o‘zgarmaydi.
 

@@ -39,6 +39,7 @@ class NotificationKind(str, enum.Enum):
     NOON = "noon"
     EVENING = "evening"
     POLL = "poll"
+    ADMIN_ALERT = "admin_alert"
 
 
 class User(Base):
@@ -74,6 +75,8 @@ class FoodAssignment(Base):
     status: Mapped[AssignmentStatus] = mapped_column(
         Enum(AssignmentStatus), default=AssignmentStatus.ACTIVE, nullable=False
     )
+    # Supporting evidence only; the nightly poll still decides the rotation.
+    reported_done_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 

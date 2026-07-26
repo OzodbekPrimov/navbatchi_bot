@@ -181,11 +181,36 @@ async def create_completion_poll(
     if existing:
         return existing
     zone = ZoneInfo(timezone_name)
-    closes_at = datetime.combine(assignment.duty_date + timedelta(days=1), time(0, 15), zone).astimezone(UTC)
+    closes_at = datetime.combine(assignment.duty_date, time(23, 59), zone).astimezone(UTC)
     poll = CompletionPoll(assignment_id=assignment.id, closes_at=closes_at)
     session.add(poll)
     await session.commit()
     return poll
+
+
+async def confirm_food_prepared(
+    session: AsyncSession,
+    assignment_id: int,
+    user_id: int,
+    timezone_name: str,
+    now: datetime | None = None,
+) -> FoodAssignment:
+    """Record the duty holder's self-report before the local-day deadline."""
+    now = now or utc_now()
+    assignment = await session.scalar(
+        select(FoodAssignment).where(FoodAssignment.id == assignment_id).with_for_update()
+    )
+    if assignment is None or assignment.status != AssignmentStatus.ACTIVE:
+        raise DomainError("Bu navbat endi faol emas.")
+    if assignment.assigned_user_id != user_id:
+        raise DomainError("Faqat hozirgi navbatchi bu tasdiqni bera oladi.")
+    deadline = datetime.combine(assignment.duty_date + timedelta(days=1), time.min, ZoneInfo(timezone_name)).astimezone(UTC)
+    if now >= deadline:
+        raise DomainError("Bugungi tasdiqlash vaqti tugagan.")
+    if assignment.reported_done_at is None:
+        assignment.reported_done_at = now
+        await session.commit()
+    return assignment
 
 
 async def cast_vote(
@@ -213,13 +238,17 @@ async def cast_vote(
 
 async def resolve_poll(session: AsyncSession, poll: CompletionPoll, now: datetime | None = None) -> FoodAssignment:
     now = now or utc_now()
+    poll = await session.scalar(select(CompletionPoll).where(CompletionPoll.id == poll.id).with_for_update())
+    assert poll is not None
     if poll.status == PollStatus.CLOSED:
         assignment = await session.get(FoodAssignment, poll.assignment_id)
         assert assignment is not None
         return assignment
     if poll.closes_at > now:
         raise DomainError("So‘rovnoma hali yopilmagan.")
-    assignment = await session.get(FoodAssignment, poll.assignment_id)
+    assignment = await session.scalar(
+        select(FoodAssignment).where(FoodAssignment.id == poll.assignment_id).with_for_update()
+    )
     assert assignment is not None
     no_votes = await session.scalar(
         select(func.count(PollVote.id)).where(PollVote.poll_id == poll.id, PollVote.value == VoteValue.NO)
@@ -227,7 +256,9 @@ async def resolve_poll(session: AsyncSession, poll: CompletionPoll, now: datetim
     yes_votes = await session.scalar(
         select(func.count(PollVote.id)).where(PollVote.poll_id == poll.id, PollVote.value == VoteValue.YES)
     ) or 0
-    passed = no_votes < 2 and yes_votes > 0
+    # A self-report is enough only when nobody objects or votes. One "No" still needs a
+    # positive confirmation from another roommate; two "No" votes always repeat the duty.
+    passed = no_votes < 2 and (yes_votes > 0 or (no_votes == 0 and assignment.reported_done_at is not None))
     assignment.status = AssignmentStatus.COMPLETED if passed else AssignmentStatus.NOT_COMPLETED
     assignment.resolved_at = now
     poll.status = PollStatus.CLOSED
@@ -242,6 +273,15 @@ async def resolve_poll(session: AsyncSession, poll: CompletionPoll, now: datetim
         session.add(next_assignment)
     await session.commit()
     return assignment
+
+
+async def poll_has_no_activity(session: AsyncSession, poll: CompletionPoll) -> bool:
+    """Return whether neither roommates nor the duty holder provided a signal."""
+    assignment = await session.get(FoodAssignment, poll.assignment_id)
+    if assignment is None or assignment.reported_done_at is not None:
+        return False
+    vote_count = await session.scalar(select(func.count(PollVote.id)).where(PollVote.poll_id == poll.id)) or 0
+    return vote_count == 0
 
 
 async def create_transfer_request(
@@ -292,6 +332,7 @@ async def decide_transfer(
     request.resolved_at = utc_now()
     if accepted:
         assignment.assigned_user_id = recipient_user_id
+        assignment.reported_done_at = None
     await session.commit()
     return request, assignment
 
@@ -302,6 +343,7 @@ async def reassign_today(session: AsyncSession, assignment: FoodAssignment, user
     if await session.scalar(select(CompletionPoll.id).where(CompletionPoll.assignment_id == assignment.id)):
         raise DomainError("Kechki tekshiruv boshlanganidan keyin navbatchini almashtirib bo‘lmaydi.")
     assignment.assigned_user_id = user_id
+    assignment.reported_done_at = None
     pending_requests = await session.scalars(
         select(TransferRequest).where(
             TransferRequest.assignment_id == assignment.id, TransferRequest.status == TransferStatus.PENDING

@@ -1,5 +1,6 @@
 from collections.abc import AsyncIterator
 
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
 
@@ -21,11 +22,29 @@ async def get_session() -> AsyncIterator[AsyncSession]:
 
 
 async def create_schema() -> None:
-    # MVP bootstrap. Replace with Alembic migrations before changing a live schema.
+    # MVP bootstrap. The small compatibility upgrade keeps existing installations working.
+    # Replace this with Alembic before the schema starts changing frequently.
     from app import models  # noqa: F401
 
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
+        if connection.dialect.name == "postgresql":
+            await connection.execute(
+                text("ALTER TYPE notificationkind ADD VALUE IF NOT EXISTS 'admin_alert'")
+            )
+            await connection.execute(
+                text(
+                    "ALTER TABLE food_assignments "
+                    "ADD COLUMN IF NOT EXISTS reported_done_at TIMESTAMP WITH TIME ZONE"
+                )
+            )
+        elif connection.dialect.name == "sqlite":
+            result = await connection.execute(text("PRAGMA table_info(food_assignments)"))
+            columns = result.mappings().all()
+            if "reported_done_at" not in {column["name"] for column in columns}:
+                await connection.execute(
+                    text("ALTER TABLE food_assignments ADD COLUMN reported_done_at DATETIME")
+                )
 
 
 async def close_database() -> None:

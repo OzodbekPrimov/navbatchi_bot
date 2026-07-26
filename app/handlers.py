@@ -18,6 +18,7 @@ from app.services import (
     active_queue,
     add_queue_member,
     cast_vote,
+    confirm_food_prepared,
     create_initial_assignment,
     create_transfer_request,
     current_assignment,
@@ -124,9 +125,34 @@ def build_router(settings: Settings) -> Router:
         async with SessionFactory() as session:
             assignment = await current_assignment(session, today_local())
             if assignment and assignment.assigned_user_id == user.id:
-                await message.answer("📌 Bugun siz ovqat navbatchisisiz. Eslatmalar: 07:00, 12:00 va 19:00.")
+                markup = InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [
+                            InlineKeyboardButton(
+                                text="✅ Ovqat tayyorladim",
+                                callback_data=f"duty:done:{assignment.id}",
+                            )
+                        ]
+                    ]
+                )
+                status = "\n✅ Tayyorlaganingiz qayd etilgan." if assignment.reported_done_at else ""
+                await message.answer(
+                    f"📌 Bugun siz ovqat navbatchisisiz. Eslatmalar: 07:00, 12:00 va 19:00.{status}",
+                    reply_markup=markup,
+                )
             else:
                 await message.answer("Bugun sizning ovqat navbatingiz emas.")
+
+    @router.callback_query(F.data.startswith("duty:done:"))
+    async def duty_done(callback: CallbackQuery) -> None:
+        try:
+            user = await callback_user(callback)
+            assignment_id = int(callback.data.rsplit(":", 1)[1])
+            async with SessionFactory() as session:
+                await confirm_food_prepared(session, assignment_id, user.id, settings.timezone)
+            await callback.answer("✅ Tayyorlaganingiz qayd etildi.")
+        except (DomainError, ValueError) as error:
+            await callback.answer(str(error), show_alert=True)
 
     @router.message(F.text == HISTORY)
     async def history(message: Message) -> None:
