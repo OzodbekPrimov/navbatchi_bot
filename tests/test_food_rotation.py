@@ -2,21 +2,25 @@ import os
 from datetime import date, timedelta
 
 import pytest
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 os.environ.setdefault("BOT_TOKEN", "test-token")
 os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite://")
 
 from app.database import Base
-from app.models import AssignmentStatus, User, VoteValue
+from app.models import AssignmentStatus, GroupNotificationKind, GroupNotificationLog, User, VoteValue
 from app.services import (
     add_queue_member,
     cast_vote,
     confirm_food_prepared,
     create_completion_poll,
     create_initial_assignment,
+    enqueue_group_notification,
     get_assignment_for_date,
+    reassign_today,
     resolve_poll,
+    set_active_room,
 )
 
 
@@ -106,3 +110,26 @@ async def test_no_votes_and_no_self_report_repeats_the_duty(session):
     assert assignment.status == AssignmentStatus.NOT_COMPLETED
     assert tomorrow is not None
     assert tomorrow.scheduled_user_id == first.id
+
+
+@pytest.mark.asyncio
+async def test_group_notifications_are_idempotent_and_follow_reassignment(session):
+    first, second = await add_people(session, 2)
+    assignment = await create_initial_assignment(session, date(2026, 1, 1), first.id)
+    await set_active_room(session, -1001234567890, "Xonadoshlar", first.id)
+
+    first_log = await enqueue_group_notification(session, assignment, GroupNotificationKind.DAILY_DUTY)
+    await session.commit()
+    duplicate_log = await enqueue_group_notification(session, assignment, GroupNotificationKind.DAILY_DUTY)
+    await session.commit()
+    assert first_log is not None
+    assert duplicate_log is not None
+    assert duplicate_log.id == first_log.id
+
+    await reassign_today(session, assignment, second.id)
+    logs = list((await session.scalars(select(GroupNotificationLog).order_by(GroupNotificationLog.id))).all())
+
+    assert [(log.kind, log.target_user_id, log.revision) for log in logs] == [
+        (GroupNotificationKind.DAILY_DUTY, first.id, 0),
+        (GroupNotificationKind.DUTY_CHANGED, second.id, 1),
+    ]

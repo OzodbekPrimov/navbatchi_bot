@@ -11,10 +11,13 @@ from app.models import (
     CompletionPoll,
     FoodAssignment,
     FoodQueueMember,
+    GroupNotificationKind,
+    GroupNotificationLog,
     NotificationKind,
     NotificationLog,
     PollStatus,
     PollVote,
+    RoomSetting,
     TransferRequest,
     TransferStatus,
     User,
@@ -170,6 +173,84 @@ async def current_assignment(session: AsyncSession, duty_date: date) -> FoodAssi
             FoodAssignment.duty_date == duty_date, FoodAssignment.status == AssignmentStatus.ACTIVE
         )
     )
+
+
+async def set_active_room(
+    session: AsyncSession, chat_id: int, title: str | None, configured_by_user_id: int
+) -> RoomSetting:
+    """Bind this single-room MVP to a group, replacing any previously active group."""
+    active_rooms = await session.scalars(select(RoomSetting).where(RoomSetting.is_active.is_(True)))
+    for room in active_rooms:
+        room.is_active = False
+    room = await session.scalar(select(RoomSetting).where(RoomSetting.chat_id == chat_id))
+    if room is None:
+        room = RoomSetting(
+            chat_id=chat_id,
+            title=title[:255] if title else None,
+            configured_by_user_id=configured_by_user_id,
+        )
+        session.add(room)
+    else:
+        room.is_active = True
+        room.title = title[:255] if title else room.title
+        room.configured_by_user_id = configured_by_user_id
+    await session.commit()
+    return room
+
+
+async def deactivate_room(session: AsyncSession, chat_id: int) -> bool:
+    room = await session.scalar(
+        select(RoomSetting).where(RoomSetting.chat_id == chat_id, RoomSetting.is_active.is_(True))
+    )
+    if room is None:
+        return False
+    room.is_active = False
+    await session.commit()
+    return True
+
+
+async def active_room(session: AsyncSession) -> RoomSetting | None:
+    return await session.scalar(
+        select(RoomSetting).where(RoomSetting.is_active.is_(True)).order_by(RoomSetting.id.desc())
+    )
+
+
+async def enqueue_group_notification(
+    session: AsyncSession, assignment: FoodAssignment, kind: GroupNotificationKind
+) -> GroupNotificationLog | None:
+    """Add a durable group outbox item. It is safe to call repeatedly."""
+    room = await active_room(session)
+    if room is None:
+        return None
+    if kind == GroupNotificationKind.DAILY_DUTY:
+        existing = await session.scalar(
+            select(GroupNotificationLog).where(
+                GroupNotificationLog.assignment_id == assignment.id,
+                GroupNotificationLog.chat_id == room.chat_id,
+                GroupNotificationLog.kind == GroupNotificationKind.DAILY_DUTY,
+            )
+        )
+    else:
+        existing = await session.scalar(
+            select(GroupNotificationLog).where(
+                GroupNotificationLog.assignment_id == assignment.id,
+                GroupNotificationLog.chat_id == room.chat_id,
+                GroupNotificationLog.kind == kind,
+                GroupNotificationLog.revision == assignment.notification_revision,
+            )
+        )
+    if existing is not None:
+        return existing
+    log = GroupNotificationLog(
+        assignment_id=assignment.id,
+        chat_id=room.chat_id,
+        target_user_id=assignment.assigned_user_id,
+        kind=kind,
+        revision=assignment.notification_revision,
+    )
+    session.add(log)
+    await session.flush()
+    return log
 
 
 async def create_completion_poll(
@@ -333,6 +414,8 @@ async def decide_transfer(
     if accepted:
         assignment.assigned_user_id = recipient_user_id
         assignment.reported_done_at = None
+        assignment.notification_revision += 1
+        await enqueue_group_notification(session, assignment, GroupNotificationKind.DUTY_CHANGED)
     await session.commit()
     return request, assignment
 
@@ -342,8 +425,11 @@ async def reassign_today(session: AsyncSession, assignment: FoodAssignment, user
         raise DomainError("Faol navbatdagi foydalanuvchini tanlang.")
     if await session.scalar(select(CompletionPoll.id).where(CompletionPoll.assignment_id == assignment.id)):
         raise DomainError("Kechki tekshiruv boshlanganidan keyin navbatchini almashtirib bo‘lmaydi.")
-    assignment.assigned_user_id = user_id
-    assignment.reported_done_at = None
+    if assignment.assigned_user_id != user_id:
+        assignment.assigned_user_id = user_id
+        assignment.reported_done_at = None
+        assignment.notification_revision += 1
+        await enqueue_group_notification(session, assignment, GroupNotificationKind.DUTY_CHANGED)
     pending_requests = await session.scalars(
         select(TransferRequest).where(
             TransferRequest.assignment_id == assignment.id, TransferRequest.status == TransferStatus.PENDING
@@ -400,5 +486,44 @@ async def finish_notification(
         delay_minutes = min(5 * log.attempts, 60)
         log.next_attempt_at = utc_now() + timedelta(minutes=delay_minutes)
     else:
+        log.next_attempt_at = None
+    await session.commit()
+
+
+async def pending_group_notifications(session: AsyncSession, now: datetime) -> list[GroupNotificationLog]:
+    room = await active_room(session)
+    if room is None:
+        return []
+    result = await session.scalars(
+        select(GroupNotificationLog)
+        .where(
+            GroupNotificationLog.chat_id == room.chat_id,
+            GroupNotificationLog.sent_at.is_(None),
+            GroupNotificationLog.is_terminal.is_(False),
+        )
+        .order_by(GroupNotificationLog.id)
+    )
+    return [
+        log
+        for log in result
+        if log.next_attempt_at is None or log.next_attempt_at <= now
+    ]
+
+
+async def finish_group_notification(
+    session: AsyncSession,
+    log: GroupNotificationLog,
+    error: str | None = None,
+    terminal: bool = False,
+) -> None:
+    if error:
+        log.error = error
+        log.attempts += 1
+        log.is_terminal = terminal
+        delay_minutes = min(5 * log.attempts, 60)
+        log.next_attempt_at = utc_now() + timedelta(minutes=delay_minutes)
+    else:
+        log.sent_at = utc_now()
+        log.error = None
         log.next_attempt_at = None
     await session.commit()

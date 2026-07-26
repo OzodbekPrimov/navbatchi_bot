@@ -21,6 +21,7 @@ Bot bitta process bo‘lib ishlaydi. Scheduler xabar yuborilganini `notification
 - Admin navbatni boshlaganda bugungi birinchi navbatchini tanlaydi.
 - Navbatchiga Toshkent vaqti bilan 07:00, 12:00 va 19:00 da xabar yuboriladi. Bot vaqtincha to‘xtagan bo‘lsa, qaytganda faqat eng so‘nggi o‘tkazib yuborilgan eslatmani yuboradi.
 - Navbatchi `Ovqat tayyorladim` tugmasi bilan bajarganini qayd qilishi mumkin; bu yakuniy ovoz o‘rnini bosmaydi.
+- Bot guruhga 07:00 dan keyin bir marta bugungi navbatchini Telegram mention bilan e’lon qiladi. Navbatchi o‘zgarsa, guruhga yangi mention bilan yangilanish yuboriladi.
 - 22:00 da navbatchidan tashqari faol qatnashchilarga tekshiruv yuboriladi.
 - Ovoz berish 23:59 da yopiladi:
   - kamida 2 ta `Yo‘q` — ertaga ham o‘sha rejalashtirilgan navbatchi;
@@ -43,6 +44,15 @@ docker compose logs -f bot
 ```
 
 Telegram ID ni [@userinfobot](https://t.me/userinfobot) kabi bot orqali bilib olish mumkin. Qatnashchilar avval botga `/start` yuborishlari kerak; keyin admin ularni `⚙️ Admin → 👥 Qatnashchilar` orqali navbatga qo‘shadi.
+
+### Guruhni ulash
+
+1. Botni xonadoshlar Telegram guruhiga qo‘shing; unga xabar yuborish huquqi bo‘lishi kerak.
+2. Guruhdagi admin `/setup_group` buyrug‘ini yuboradi.
+3. Bot guruhni avtomatik saqlaydi va kunlik e’lonlarni shu yerga yuboradi.
+4. Guruhni uzish kerak bo‘lsa, o‘sha guruhda `/unlink_group` yuboring.
+
+Guruh e’lonlari va o‘zgarishlar bazada alohida loglanadi. Shu sabab server restarti ularni takror yubormaydi; Telegram xatosida bot qayta urinadi va guruhga yozish huquqi yo‘qolsa admin’ga shaxsiy ogohlantirish yuboradi.
 
 ## Birinchi sozlash
 

@@ -6,6 +6,7 @@ from zoneinfo import ZoneInfo
 from aiogram import F, Router
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
+from aiogram.enums import ChatType
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from sqlalchemy import select
 
@@ -22,6 +23,7 @@ from app.services import (
     create_initial_assignment,
     create_transfer_request,
     current_assignment,
+    deactivate_room,
     decide_transfer,
     get_assignment_for_date,
     get_or_create_user,
@@ -30,6 +32,7 @@ from app.services import (
     move_queue_member,
     reassign_today,
     remove_queue_member,
+    set_active_room,
 )
 from app.states import TransferStates
 
@@ -106,6 +109,34 @@ def build_router(settings: Settings) -> Router:
     async def menu(message: Message) -> None:
         user = await register(message)
         await message.answer("Asosiy menyu", reply_markup=main_menu(user.is_admin))
+
+    @router.message(Command("setup_group"))
+    async def setup_group(message: Message) -> None:
+        if message.chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}:
+            await message.answer("Bu buyruqni xonadoshlar guruhida yuboring.")
+            return
+        user = await register(message)
+        if not user.is_admin:
+            await message.answer("Guruhni faqat admin ulay oladi.")
+            return
+        async with SessionFactory() as session:
+            await set_active_room(session, message.chat.id, message.chat.title, user.id)
+        await message.answer(
+            "✅ Guruh ulandi. Har kuni 07:00 dan keyin bugungi navbatchi shu guruhda belgilanadi."
+        )
+
+    @router.message(Command("unlink_group"))
+    async def unlink_group(message: Message) -> None:
+        if message.chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}:
+            await message.answer("Bu buyruqni ulangan guruhda yuboring.")
+            return
+        user = await register(message)
+        if not user.is_admin:
+            await message.answer("Guruhni faqat admin uza oladi.")
+            return
+        async with SessionFactory() as session:
+            removed = await deactivate_room(session, message.chat.id)
+        await message.answer("✅ Guruh uzildi." if removed else "Bu guruh hozir ulanmagan.")
 
     @router.message(F.text == TODAY)
     async def today(message: Message) -> None:

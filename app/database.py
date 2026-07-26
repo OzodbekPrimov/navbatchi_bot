@@ -33,9 +33,18 @@ async def create_schema() -> None:
                 text("ALTER TYPE notificationkind ADD VALUE IF NOT EXISTS 'admin_alert'")
             )
             await connection.execute(
+                text("ALTER TYPE notificationkind ADD VALUE IF NOT EXISTS 'group_error'")
+            )
+            await connection.execute(
                 text(
                     "ALTER TABLE food_assignments "
                     "ADD COLUMN IF NOT EXISTS reported_done_at TIMESTAMP WITH TIME ZONE"
+                )
+            )
+            await connection.execute(
+                text(
+                    "ALTER TABLE food_assignments "
+                    "ADD COLUMN IF NOT EXISTS notification_revision INTEGER NOT NULL DEFAULT 0"
                 )
             )
         elif connection.dialect.name == "sqlite":
@@ -44,6 +53,10 @@ async def create_schema() -> None:
             if "reported_done_at" not in {column["name"] for column in columns}:
                 await connection.execute(
                     text("ALTER TABLE food_assignments ADD COLUMN reported_done_at DATETIME")
+                )
+            if "notification_revision" not in {column["name"] for column in columns}:
+                await connection.execute(
+                    text("ALTER TABLE food_assignments ADD COLUMN notification_revision INTEGER NOT NULL DEFAULT 0")
                 )
 
 

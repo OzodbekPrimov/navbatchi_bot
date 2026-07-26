@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime, time
+from html import escape
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot
+from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError, TelegramForbiddenError
 from sqlalchemy import select
 
@@ -15,6 +17,7 @@ from app.models import (
     AssignmentStatus,
     CompletionPoll,
     FoodAssignment,
+    GroupNotificationKind,
     NotificationKind,
     PollStatus,
     User,
@@ -24,7 +27,10 @@ from app.services import (
     claim_notification,
     create_completion_poll,
     current_assignment,
+    enqueue_group_notification,
+    finish_group_notification,
     finish_notification,
+    pending_group_notifications,
     poll_has_no_activity,
     resolve_poll,
     utc_now,
@@ -89,6 +95,8 @@ class DutyScheduler:
 
         for assignment_id in set(no_activity_assignment_ids):
             await self._send_no_activity_alert(assignment_id)
+        await self._queue_daily_group_announcement(local_now)
+        await self._send_pending_group_notifications()
         await self._send_open_poll_messages(now)
         await self._send_due_reminders(local_now)
 
@@ -167,6 +175,44 @@ class DutyScheduler:
                         reply_markup=markup,
                     )
 
+    async def _queue_daily_group_announcement(self, local_now: datetime) -> None:
+        if local_now.time() < time(7):
+            return
+        async with SessionFactory() as session:
+            assignment = await current_assignment(session, local_now.date())
+            if assignment is None:
+                return
+            await enqueue_group_notification(session, assignment, GroupNotificationKind.DAILY_DUTY)
+            await session.commit()
+
+    async def _send_pending_group_notifications(self) -> None:
+        failed_assignment_ids: set[int] = set()
+        async with SessionFactory() as session:
+            for log in await pending_group_notifications(session, utc_now()):
+                target = await session.get(User, log.target_user_id)
+                if target is None:
+                    await finish_group_notification(session, log, "Duty user no longer exists", terminal=True)
+                    failed_assignment_ids.add(log.assignment_id)
+                    continue
+                mention = f'<a href="tg://user?id={target.telegram_id}">{escape(target.full_name)}</a>'
+                text = (
+                    f"🍽 {mention}, bugun sizning ovqat navbatingiz."
+                    if log.kind == GroupNotificationKind.DAILY_DUTY
+                    else f"🔄 Bugungi ovqat navbati o‘zgardi: {mention} endi navbatchi."
+                )
+                try:
+                    await self.bot.send_message(log.chat_id, text, parse_mode=ParseMode.HTML)
+                except TelegramForbiddenError as error:
+                    await finish_group_notification(session, log, str(error), terminal=True)
+                    failed_assignment_ids.add(log.assignment_id)
+                except TelegramAPIError as error:
+                    await finish_group_notification(session, log, str(error))
+                    logger.warning("Could not send group notification to %s: %s", log.chat_id, error)
+                else:
+                    await finish_group_notification(session, log)
+        for assignment_id in failed_assignment_ids:
+            await self._send_group_error_alert(assignment_id)
+
     async def _send_no_activity_alert(self, assignment_id: int) -> None:
         async with SessionFactory() as session:
             assignment = await session.get(FoodAssignment, assignment_id)
@@ -185,6 +231,24 @@ class DutyScheduler:
                     admin,
                     f"⚠️ {assignee.full_name if assignee else 'Navbatchi'} uchun hech kim ovoz bermadi "
                     "va u ham ovqat tayyorlaganini tasdiqlamadi. Navbat ertaga takrorlanadi.",
+                )
+
+    async def _send_group_error_alert(self, assignment_id: int) -> None:
+        async with SessionFactory() as session:
+            assignment = await session.get(FoodAssignment, assignment_id)
+            if assignment is None:
+                return
+            admins = list((await session.scalars(select(User).where(User.is_admin.is_(True)))).all())
+            for admin in admins:
+                claimed = await claim_notification(session, assignment.id, NotificationKind.GROUP_ERROR, admin.id)
+                if not claimed:
+                    continue
+                await self._send_and_log(
+                    session,
+                    assignment.id,
+                    NotificationKind.GROUP_ERROR,
+                    admin,
+                    "⚠️ Guruhga navbatchi e’loni yuborilmadi. Botni guruhga qayta qo‘shing va yozish huquqini tekshiring.",
                 )
 
     async def _send_and_log(self, session, assignment_id, kind, user, text, reply_markup=None) -> None:

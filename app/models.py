@@ -40,6 +40,12 @@ class NotificationKind(str, enum.Enum):
     EVENING = "evening"
     POLL = "poll"
     ADMIN_ALERT = "admin_alert"
+    GROUP_ERROR = "group_error"
+
+
+class GroupNotificationKind(str, enum.Enum):
+    DAILY_DUTY = "daily_duty"
+    DUTY_CHANGED = "duty_changed"
 
 
 class User(Base):
@@ -77,6 +83,8 @@ class FoodAssignment(Base):
     )
     # Supporting evidence only; the nightly poll still decides the rotation.
     reported_done_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Increments whenever today's effective duty holder changes.
+    notification_revision: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
@@ -129,6 +137,42 @@ class NotificationLog(Base):
     assignment_id: Mapped[int] = mapped_column(ForeignKey("food_assignments.id", ondelete="CASCADE"))
     kind: Mapped[NotificationKind] = mapped_column(Enum(NotificationKind))
     recipient_user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"))
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    is_terminal: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+
+class RoomSetting(Base):
+    __tablename__ = "room_settings"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    chat_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True)
+    title: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False, index=True)
+    configured_by_user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class GroupNotificationLog(Base):
+    __tablename__ = "group_notification_logs"
+    __table_args__ = (
+        UniqueConstraint(
+            "assignment_id",
+            "chat_id",
+            "kind",
+            "revision",
+            name="uq_group_notification_assignment_chat_kind_revision",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    assignment_id: Mapped[int] = mapped_column(ForeignKey("food_assignments.id", ondelete="CASCADE"))
+    chat_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    target_user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"))
+    kind: Mapped[GroupNotificationKind] = mapped_column(Enum(GroupNotificationKind))
+    revision: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
