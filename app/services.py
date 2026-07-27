@@ -5,6 +5,7 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy import Select, delete, func, select, union
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from app.models import (
     AssignmentStatus,
@@ -65,9 +66,60 @@ async def get_or_create_user(
     else:
         user.full_name = full_name[:255]
         user.username = username[:255] if username else None
-        user.is_admin = user.is_admin or is_admin
+        # ADMIN_IDS is the source of truth.  In particular, removing an ID from
+        # the configuration must revoke its old database-level permission.
+        user.is_admin = is_admin
     await session.commit()
     return user
+
+
+async def food_history_page(
+    session: AsyncSession, *, offset: int = 0, limit: int = 10
+) -> tuple[list[tuple[FoodAssignment, User, User]], bool]:
+    """Return resolved food duties with the planned and effective assignees."""
+    scheduled_user = aliased(User)
+    assigned_user = aliased(User)
+    rows = list(
+        (
+            await session.execute(
+                select(FoodAssignment, scheduled_user, assigned_user)
+                .join(scheduled_user, scheduled_user.id == FoodAssignment.scheduled_user_id)
+                .join(assigned_user, assigned_user.id == FoodAssignment.assigned_user_id)
+                .where(FoodAssignment.status != AssignmentStatus.ACTIVE)
+                .order_by(FoodAssignment.duty_date.desc(), FoodAssignment.id.desc())
+                .offset(offset)
+                .limit(limit + 1)
+            )
+        ).all()
+    )
+    return rows[:limit], len(rows) > limit
+
+
+async def supply_history_page(
+    session: AsyncSession, supply_type: SupplyType, *, offset: int = 0, limit: int = 10
+) -> tuple[list[tuple[SupplyTask, User, User, User]], bool]:
+    """Return completed supply duties with requester, planned and actual users."""
+    requester = aliased(User)
+    scheduled_user = aliased(User)
+    assigned_user = aliased(User)
+    rows = list(
+        (
+            await session.execute(
+                select(SupplyTask, requester, scheduled_user, assigned_user)
+                .join(requester, requester.id == SupplyTask.requester_user_id)
+                .join(scheduled_user, scheduled_user.id == SupplyTask.scheduled_user_id)
+                .join(assigned_user, assigned_user.id == SupplyTask.assigned_user_id)
+                .where(
+                    SupplyTask.supply_type == supply_type,
+                    SupplyTask.status == SupplyTaskStatus.COMPLETED,
+                )
+                .order_by(SupplyTask.completed_at.desc(), SupplyTask.id.desc())
+                .offset(offset)
+                .limit(limit + 1)
+            )
+        ).all()
+    )
+    return rows[:limit], len(rows) > limit
 
 
 async def get_user_by_telegram_id(session: AsyncSession, telegram_id: int) -> User | None:

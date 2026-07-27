@@ -61,7 +61,7 @@ Telegram ID ni [@userinfobot](https://t.me/userinfobot) kabi bot orqali bilib ol
 ### Guruhni ulash
 
 1. Botni xonadoshlar Telegram guruhiga qo‘shing; unga xabar yuborish huquqi bo‘lishi kerak.
-2. Guruhdagi admin `/setup_group` buyrug‘ini yuboradi.
+2. `ADMIN_IDS` ichidagi va Telegram guruhida ham admin bo‘lgan foydalanuvchi `/setup_group` buyrug‘ini yuboradi.
 3. Bot guruhni avtomatik saqlaydi va kunlik e’lonlarni shu yerga yuboradi.
 4. Guruhni uzish kerak bo‘lsa, o‘sha guruhda `/unlink_group` yuboring.
 
@@ -81,6 +81,10 @@ Guruh e’lonlari va o‘zgarishlar bazada alohida loglanadi. Shu sabab server r
 - `📋 Bugungi holat` — ovqatning bugungi odami, non/suvning faol vazifasi yoki keyingi odamini ko‘rsatadi.
 - `📌 Mening navbatlarim` — foydalanuvchining ovqat vazifasi va non/suvdagi navbat o‘rnini ko‘rsatadi; faol vazifa bo‘lsa kerakli tugmalar ham chiqadi.
 - `⚙️ Admin → 📊 Umumiy holat` — uchala navbatning bitta ekrandagi holati.
+
+## Tarix
+
+`📜 Tarix` menyusi ovqat, suv va non uchun yakunlangan vazifalarni alohida bo‘limlarda chiqaradi. Har bo‘limda oxirgi 10 ta yozuv va eski yozuvlarga o‘tish tugmalari bo‘ladi; transfer yuz berganda rejalashtirilgan hamda amalda bajargan xonadosh ko‘rsatiladi.
 
 ## Loyihadagi muhim qismlar
 

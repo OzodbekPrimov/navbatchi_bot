@@ -1,7 +1,19 @@
 import enum
 from datetime import UTC, date, datetime
 
-from sqlalchemy import BigInteger, Boolean, Date, DateTime, Enum, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    Date,
+    DateTime,
+    Enum,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
@@ -233,6 +245,7 @@ class SupplyRotationState(Base):
 
 class SupplyTask(Base):
     __tablename__ = "supply_tasks"
+    __table_args__ = (Index("ix_supply_tasks_type_completed_at", "supply_type", "completed_at"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
     supply_type: Mapped[SupplyType] = mapped_column(Enum(SupplyType), index=True)

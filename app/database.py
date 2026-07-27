@@ -28,6 +28,14 @@ async def create_schema() -> None:
 
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
+        # create_all only adds indexes for a new database. Keep existing MVP
+        # installations fast until schema changes are managed by Alembic.
+        await connection.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_supply_tasks_type_completed_at "
+                "ON supply_tasks (supply_type, completed_at DESC)"
+            )
+        )
         if connection.dialect.name == "postgresql":
             await connection.execute(
                 text("ALTER TYPE notificationkind ADD VALUE IF NOT EXISTS 'admin_alert'")

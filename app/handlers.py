@@ -1,18 +1,30 @@
 from __future__ import annotations
 
 from datetime import date, datetime
+from html import escape
 from zoneinfo import ZoneInfo
 
 from aiogram import F, Router
+from aiogram.enums import ChatType
+from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
-from aiogram.enums import ChatType
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from sqlalchemy import select
 
 from app.config import Settings
 from app.database import SessionFactory
-from app.keyboards import ADMIN, BREAD_EMPTY, HISTORY, MY_DUTY, STATUS, TODAY, TRANSFER, WATER_EMPTY, main_menu
+from app.keyboards import (
+    ADMIN,
+    BREAD_EMPTY,
+    HISTORY,
+    MY_DUTY,
+    STATUS,
+    TODAY,
+    TRANSFER,
+    WATER_EMPTY,
+    main_menu,
+)
 from app.models import (
     FoodAssignment,
     SupplyActiveTask,
@@ -32,16 +44,18 @@ from app.services import (
     active_queue,
     active_supply_queue,
     add_queue_member,
-    cast_vote,
+    add_supply_queue_member,
     cast_supply_vote,
+    cast_vote,
     confirm_food_prepared,
     create_initial_assignment,
-    create_transfer_request,
     create_supply_transfer,
+    create_transfer_request,
     current_assignment,
     deactivate_room,
-    decide_transfer,
     decide_supply_transfer,
+    decide_transfer,
+    food_history_page,
     get_assignment_for_date,
     get_or_create_user,
     get_user_by_telegram_id,
@@ -49,14 +63,14 @@ from app.services import (
     move_queue_member,
     move_supply_queue_member,
     open_supply_task,
-    reassign_today,
     reassign_supply_task,
+    reassign_today,
     remove_queue_member,
-    add_supply_queue_member,
     remove_supply_queue_member,
     report_supply_brought,
-    set_supply_current_user,
     set_active_room,
+    set_supply_current_user,
+    supply_history_page,
 )
 from app.states import TransferStates
 
@@ -90,9 +104,19 @@ def build_router(settings: Settings) -> Router:
 
     async def require_admin(callback: CallbackQuery) -> User:
         user = await callback_user(callback)
-        if not user.is_admin:
+        if user.telegram_id not in settings.parsed_admin_ids:
             raise DomainError("Bu bo‘lim faqat admin uchun.")
         return user
+
+    async def require_group_admin(message: Message) -> None:
+        """Require Telegram group-admin rights in addition to the bot role."""
+        assert message.from_user is not None
+        try:
+            administrators = await message.chat.get_administrators()
+        except TelegramAPIError as error:
+            raise DomainError("Guruh administratorlarini tekshirib bo‘lmadi.") from error
+        if message.from_user.id not in {member.user.id for member in administrators}:
+            raise DomainError("Bu buyruqni guruh administratori yuborishi kerak.")
 
     async def user_for_message(message: Message) -> User | None:
         if message.from_user is None:
@@ -172,6 +196,117 @@ def build_router(settings: Settings) -> Router:
         place = (user_index - current_index) % len(entries) + 1
         return f"{label}: siz navbatda {place}-o‘rindasiz." if place > 1 else f"{label}: keyingi navbatchi sizsiz."
 
+    history_page_size = 10
+
+    def history_menu_markup() -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="🍽 Ovqat", callback_data="history:food:0"),
+                    InlineKeyboardButton(text="💧 Suv", callback_data="history:water:0"),
+                ],
+                [InlineKeyboardButton(text="🥖 Non", callback_data="history:bread:0")],
+            ]
+        )
+
+    def history_page_markup(category: str, page: int, has_next: bool) -> InlineKeyboardMarkup:
+        category_buttons = []
+        for key, label in (
+            ("food", "🍽 Ovqat"),
+            ("water", "💧 Suv"),
+            ("bread", "🥖 Non"),
+        ):
+            category_buttons.append(
+                InlineKeyboardButton(
+                    text=f"• {label}" if key == category else label,
+                    callback_data="ignore" if key == category else f"history:{key}:0",
+                )
+            )
+        rows = [category_buttons]
+        navigation = []
+        if page > 0:
+            navigation.append(
+                InlineKeyboardButton(
+                    text="‹ Oldingi", callback_data=f"history:{category}:{page - 1}"
+                )
+            )
+        if has_next:
+            navigation.append(
+                InlineKeyboardButton(
+                    text="Keyingi ›", callback_data=f"history:{category}:{page + 1}"
+                )
+            )
+        if navigation:
+            rows.append(navigation)
+        rows.append([InlineKeyboardButton(text="‹ Bo‘limlar", callback_data="history:menu")])
+        return InlineKeyboardMarkup(inline_keyboard=rows)
+
+    def display_name(user: User) -> str:
+        return escape(user.full_name)
+
+    def display_time(value: datetime | None) -> str:
+        assert value is not None
+        return value.astimezone(zone).strftime("%d.%m.%Y %H:%M")
+
+    async def history_page(category: str, page: int) -> tuple[str, InlineKeyboardMarkup]:
+        offset = page * history_page_size
+        async with SessionFactory() as session:
+            if category == "food":
+                items, has_next = await food_history_page(
+                    session, offset=offset, limit=history_page_size
+                )
+                if not items:
+                    return (
+                        "🍽 <b>Ovqat tarixi</b>\n\nYakunlangan ovqat navbatlari hali yo‘q.",
+                        history_page_markup(category, page, False),
+                    )
+                status_labels = {"completed": "✅ bajardi", "not_completed": "❌ bajarmadi"}
+                lines = []
+                for assignment, scheduled, assigned in items:
+                    duty_holder = (
+                        f"Navbatchi: {display_name(assigned)}"
+                        if assignment.scheduled_user_id == assignment.assigned_user_id
+                        else f"Reja: {display_name(scheduled)} → Bajardi: {display_name(assigned)}"
+                    )
+                    lines.append(
+                        f"<b>{assignment.duty_date.strftime('%d.%m.%Y')}</b> — "
+                        f"{status_labels[assignment.status.value]}\n  {duty_holder}"
+                    )
+                return (
+                    "🍽 <b>Ovqat tarixi</b>\n\n" + "\n\n".join(lines),
+                    history_page_markup(category, page, has_next),
+                )
+
+            supply_type = SupplyType.WATER if category == "water" else SupplyType.BREAD
+            items, has_next = await supply_history_page(
+                session, supply_type, offset=offset, limit=history_page_size
+            )
+        label = (
+            "💧 <b>Suv tarixi</b>"
+            if supply_type == SupplyType.WATER
+            else "🥖 <b>Non tarixi</b>"
+        )
+        if not items:
+            return (
+                f"{label}\n\nTasdiqlangan vazifalar hali yo‘q.",
+                history_page_markup(category, page, False),
+            )
+        lines = []
+        for task, requester, scheduled, assigned in items:
+            delivery = (
+                f"Olib keldi: {display_name(assigned)}"
+                if task.scheduled_user_id == task.assigned_user_id
+                else f"Reja: {display_name(scheduled)} → Olib keldi: {display_name(assigned)}"
+            )
+            lines.append(
+                f"<b>{display_time(task.completed_at)}</b> — ✅ tasdiqlandi\n"
+                f"  {delivery}\n  So‘ragan: {display_name(requester)}"
+            )
+        return (
+            f"{label}\n\n" + "\n\n".join(lines),
+            history_page_markup(category, page, has_next),
+        )
+
     @router.message(CommandStart())
     async def start(message: Message) -> None:
         user = await register(message)
@@ -193,8 +328,13 @@ def build_router(settings: Settings) -> Router:
             await message.answer("Bu buyruqni xonadoshlar guruhida yuboring.")
             return
         user = await register(message)
-        if not user.is_admin:
+        if user.telegram_id not in settings.parsed_admin_ids:
             await message.answer("Guruhni faqat admin ulay oladi.")
+            return
+        try:
+            await require_group_admin(message)
+        except DomainError as error:
+            await message.answer(str(error))
             return
         async with SessionFactory() as session:
             await set_active_room(session, message.chat.id, message.chat.title, user.id)
@@ -208,8 +348,13 @@ def build_router(settings: Settings) -> Router:
             await message.answer("Bu buyruqni ulangan guruhda yuboring.")
             return
         user = await register(message)
-        if not user.is_admin:
+        if user.telegram_id not in settings.parsed_admin_ids:
             await message.answer("Guruhni faqat admin uza oladi.")
+            return
+        try:
+            await require_group_admin(message)
+        except DomainError as error:
+            await message.answer(str(error))
             return
         async with SessionFactory() as session:
             removed = await deactivate_room(session, message.chat.id)
@@ -408,24 +553,38 @@ def build_router(settings: Settings) -> Router:
     async def history(message: Message) -> None:
         user = await user_for_message(message)
         if user is None:
+            await message.answer("Avval /start buyrug‘ini yuboring.")
             return
-        async with SessionFactory() as session:
-            rows = await session.execute(
-                select(FoodAssignment, User)
-                .join(User, User.id == FoodAssignment.assigned_user_id)
-                .order_by(FoodAssignment.duty_date.desc())
-                .limit(10)
-            )
-            items = list(rows.all())
-        if not items:
-            await message.answer("Tarix hali bo‘sh.")
-            return
-        labels = {"active": "jarayonda", "completed": "bajardi", "not_completed": "bajarmadi"}
-        text = "📜 Oxirgi navbatlar:\n" + "\n".join(
-            f"{assignment.duty_date}: {person.full_name} — {labels[assignment.status.value]}"
-            for assignment, person in items
+        await message.answer(
+            "📜 <b>Tarix</b>\n\nKo‘rmoqchi bo‘lgan bo‘limni tanlang.",
+            reply_markup=history_menu_markup(),
         )
-        await message.answer(text)
+
+    @router.callback_query(F.data == "history:menu")
+    async def history_menu(callback: CallbackQuery) -> None:
+        try:
+            await callback_user(callback)
+            await callback.message.edit_text(
+                "📜 <b>Tarix</b>\n\nKo‘rmoqchi bo‘lgan bo‘limni tanlang.",
+                reply_markup=history_menu_markup(),
+            )
+            await callback.answer()
+        except DomainError as error:
+            await callback.answer(str(error), show_alert=True)
+
+    @router.callback_query(F.data.startswith("history:"))
+    async def history_show(callback: CallbackQuery) -> None:
+        try:
+            await callback_user(callback)
+            _, category, raw_page = callback.data.split(":")
+            page = int(raw_page)
+            if category not in {"food", "water", "bread"} or page < 0:
+                raise ValueError
+            text, markup = await history_page(category, page)
+            await callback.message.edit_text(text, reply_markup=markup)
+            await callback.answer()
+        except (DomainError, ValueError):
+            await callback.answer("Tarix sahifasi topilmadi.", show_alert=True)
 
     @router.message(F.text == TRANSFER)
     async def transfer_start(message: Message, state: FSMContext) -> None:
@@ -560,7 +719,7 @@ def build_router(settings: Settings) -> Router:
     @router.message(F.text == ADMIN)
     async def admin(message: Message) -> None:
         user = await user_for_message(message)
-        if user is None or not user.is_admin:
+        if user is None or user.telegram_id not in settings.parsed_admin_ids:
             await message.answer("Bu bo‘lim faqat admin uchun.")
             return
         keyboard = InlineKeyboardMarkup(

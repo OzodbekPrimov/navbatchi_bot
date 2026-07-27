@@ -20,8 +20,8 @@ from app.models import (
     VoteValue,
 )
 from app.services import (
-    add_supply_queue_member,
     add_queue_member,
+    add_supply_queue_member,
     cast_supply_vote,
     cast_vote,
     confirm_food_prepared,
@@ -29,15 +29,18 @@ from app.services import (
     create_initial_assignment,
     create_supply_transfer,
     decide_supply_transfer,
-    open_supply_task,
-    report_supply_brought,
     enqueue_group_notification,
+    food_history_page,
     get_assignment_for_date,
+    get_or_create_user,
+    open_supply_task,
     reassign_today,
+    report_supply_brought,
     resolve_poll,
     resolve_supply_poll,
-    set_supply_current_user,
     set_active_room,
+    set_supply_current_user,
+    supply_history_page,
 )
 
 
@@ -210,3 +213,56 @@ async def test_supply_transfer_advances_after_the_effective_delivery_person(sess
     state = await session.get(SupplyRotationState, SupplyType.BREAD)
     assert state is not None
     assert state.current_user_id == third.id
+
+
+@pytest.mark.asyncio
+async def test_history_returns_effective_assignee_after_a_food_transfer(session):
+    first, second, third = await add_people(session, 3)
+    assignment = await create_initial_assignment(session, date(2026, 1, 1), first.id)
+    await reassign_today(session, assignment, second.id)
+    poll = await create_completion_poll(session, assignment, "Asia/Tashkent")
+    await cast_vote(
+        session, poll.id, third.id, VoteValue.YES, now=poll.closes_at - timedelta(seconds=1)
+    )
+    await resolve_poll(session, poll, now=poll.closes_at + timedelta(seconds=1))
+
+    items, has_next = await food_history_page(session)
+
+    assert has_next is False
+    assert [(item.id, scheduled.id, assigned.id) for item, scheduled, assigned in items] == [
+        (assignment.id, first.id, second.id)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_supply_history_returns_completed_transferred_task(session):
+    first, second, third = await add_people(session, 3)
+    for person in (first, second, third):
+        await add_supply_queue_member(session, SupplyType.WATER, person.id)
+    await set_supply_current_user(session, SupplyType.WATER, first.id)
+    task = await open_supply_task(session, SupplyType.WATER, third.id)
+    request = await create_supply_transfer(session, task.id, first.id, second.id)
+    await decide_supply_transfer(session, request.id, second.id, accepted=True)
+    poll = await report_supply_brought(session, task.id, second.id)
+    await cast_supply_vote(
+        session, poll.id, third.id, VoteValue.YES, now=poll.closes_at - timedelta(seconds=1)
+    )
+    await resolve_supply_poll(session, poll, now=poll.closes_at + timedelta(seconds=1))
+
+    items, has_next = await supply_history_page(session, SupplyType.WATER)
+
+    assert has_next is False
+    history = [
+        (item.id, requester.id, scheduled.id, assigned.id)
+        for item, requester, scheduled, assigned in items
+    ]
+    assert history == [(task.id, third.id, first.id, second.id)]
+
+
+@pytest.mark.asyncio
+async def test_admin_role_is_revoked_when_id_is_removed_from_configuration(session):
+    user = await get_or_create_user(session, 9988, "Admin", None, is_admin=True)
+    assert user.is_admin is True
+
+    user = await get_or_create_user(session, 9988, "Admin", None, is_admin=False)
+    assert user.is_admin is False
