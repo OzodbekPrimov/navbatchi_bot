@@ -543,6 +543,31 @@ async def decide_supply_transfer(
     return request, task
 
 
+async def reassign_supply_task(session: AsyncSession, task_id: int, user_id: int) -> SupplyTask:
+    """Admin override for an open supply task before verification starts."""
+    task = await session.scalar(select(SupplyTask).where(SupplyTask.id == task_id).with_for_update())
+    if task is None or task.status != SupplyTaskStatus.AWAITING_DELIVERY:
+        raise DomainError("Faqat tekshiruv boshlanmagan faol vazifani almashtira olasiz.")
+    if not await is_supply_queue_member(session, task.supply_type, user_id):
+        raise DomainError("Yangi navbatchi shu navbatdagi faol xonadosh bo‘lishi kerak.")
+    if task.assigned_user_id == user_id:
+        return task
+    task.previous_assignee_user_id = task.assigned_user_id
+    task.assigned_user_id = user_id
+    task.notification_revision += 1
+    pending_requests = await session.scalars(
+        select(SupplyTransferRequest).where(
+            SupplyTransferRequest.task_id == task.id,
+            SupplyTransferRequest.status == SupplyTransferStatus.PENDING,
+        )
+    )
+    for request in pending_requests:
+        request.status = SupplyTransferStatus.EXPIRED
+        request.resolved_at = utc_now()
+    await session.commit()
+    return task
+
+
 async def expire_supply_transfers(
     session: AsyncSession, now: datetime | None = None
 ) -> list[SupplyTransferRequest]:

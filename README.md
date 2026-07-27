@@ -42,6 +42,7 @@ Bot bitta process bo‘lib ishlaydi. Scheduler xabar yuborilganini bazada qayd q
   - kamida 1 ta `Ha` va 2 tadan kam `Yo‘q` — navbat keyingi odamga siljiydi;
   - ovoz bo‘lmasa — `Olib keldim` tasdig‘i asosida navbat siljiydi.
 - Transfer faqat tekshiruv boshlanishidan oldin mumkin. Qabul qilinsa, eski va yangi navbatchi shaxsiy xabar oladi, guruhda ikkalasi mention bilan e’lon qilinadi. So‘rov 15 daqiqada qabul qilinmasa avtomatik bekor bo‘ladi.
+- Admin tekshiruv boshlanmaguncha `Faol vazifani almashtirish` orqali non yoki suv vazifasini bevosita boshqa navbatchiga bera oladi.
 
 ## Ishga tushirish
 

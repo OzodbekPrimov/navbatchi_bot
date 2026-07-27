@@ -50,6 +50,7 @@ from app.services import (
     move_supply_queue_member,
     open_supply_task,
     reassign_today,
+    reassign_supply_task,
     remove_queue_member,
     add_supply_queue_member,
     remove_supply_queue_member,
@@ -622,6 +623,8 @@ def build_router(settings: Settings) -> Router:
             async with SessionFactory() as session:
                 entries = await active_supply_queue(session, supply_type)
                 status = await supply_status_text(session, supply_type)
+                active = await session.get(SupplyActiveTask, supply_type)
+                active_task = await session.get(SupplyTask, active.task_id) if active else None
             buttons = [
                 [
                     InlineKeyboardButton(text="👥 Qatnashchilar", callback_data=f"supadm:members:{supply_type.value}"),
@@ -636,9 +639,58 @@ def build_router(settings: Settings) -> Router:
                         InlineKeyboardButton(text="⬇️", callback_data=f"supadm:down:{supply_type.value}:{person.id}"),
                     ]
                 )
+            if active_task and active_task.status == SupplyTaskStatus.AWAITING_DELIVERY:
+                buttons.append(
+                    [
+                        InlineKeyboardButton(
+                            text="📍 Faol vazifani almashtirish",
+                            callback_data=f"supadm:reassign:{supply_type.value}:{active_task.id}",
+                        )
+                    ]
+                )
             order = "Navbat hali tuzilmagan." if not entries else "Tartibni boshqaring yoki keyingi odamni tanlang."
             text = f"{label} navbati\n\n{status}\n\n{order}"
             await callback.message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+            await callback.answer()
+        except (DomainError, ValueError) as error:
+            await callback.answer(str(error), show_alert=True)
+
+    @router.callback_query(F.data.startswith("supadm:reassign:"))
+    async def supply_admin_reassign_options(callback: CallbackQuery) -> None:
+        try:
+            await require_admin(callback)
+            _, _, raw_type, raw_task_id = callback.data.split(":")
+            supply_type = SupplyType(raw_type)
+            async with SessionFactory() as session:
+                entries = await active_supply_queue(session, supply_type)
+            markup = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text=person.full_name,
+                            callback_data=f"supadm:settask:{supply_type.value}:{raw_task_id}:{person.id}",
+                        )
+                    ]
+                    for _, person in entries
+                ]
+            )
+            await callback.message.answer("Faol vazifani kimga berasiz?", reply_markup=markup)
+            await callback.answer()
+        except (DomainError, ValueError) as error:
+            await callback.answer(str(error), show_alert=True)
+
+    @router.callback_query(F.data.startswith("supadm:settask:"))
+    async def supply_admin_reassign_confirm(callback: CallbackQuery) -> None:
+        try:
+            await require_admin(callback)
+            _, _, raw_type, raw_task_id, raw_user_id = callback.data.split(":")
+            async with SessionFactory() as session:
+                task = await reassign_supply_task(session, int(raw_task_id), int(raw_user_id))
+                person = await session.get(User, task.assigned_user_id)
+            await callback.message.answer(
+                f"✅ Faol {('non' if raw_type == 'bread' else 'suv')} vazifasi "
+                f"{person.full_name if person else 'tanlangan odam'} ga o‘tdi."
+            )
             await callback.answer()
         except (DomainError, ValueError) as error:
             await callback.answer(str(error), show_alert=True)
