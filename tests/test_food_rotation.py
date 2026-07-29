@@ -1,5 +1,5 @@
 import os
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 from sqlalchemy import select
@@ -8,18 +8,24 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 os.environ.setdefault("BOT_TOKEN", "test-token")
 os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite://")
 
+import app.scheduler as scheduler_module
+from app.config import Settings
 from app.database import Base
 from app.models import (
     AssignmentStatus,
     GroupNotificationKind,
     GroupNotificationLog,
+    ManualReminderChannel,
+    ManualReminderLog,
     SupplyRotationState,
     SupplyTaskStatus,
     SupplyType,
     User,
     VoteValue,
 )
+from app.scheduler import DutyScheduler
 from app.services import (
+    active_manual_reminder_targets,
     add_queue_member,
     add_supply_queue_member,
     cast_supply_vote,
@@ -34,6 +40,7 @@ from app.services import (
     get_assignment_for_date,
     get_or_create_user,
     open_supply_task,
+    queue_manual_reminders,
     reassign_today,
     report_supply_brought,
     resolve_poll,
@@ -266,3 +273,77 @@ async def test_admin_role_is_revoked_when_id_is_removed_from_configuration(sessi
 
     user = await get_or_create_user(session, 9988, "Admin", None, is_admin=False)
     assert user.is_admin is False
+
+
+@pytest.mark.asyncio
+async def test_manual_reminder_queues_direct_and_group_delivery_with_cooldown(session):
+    admin, food_assignee, supply_assignee = await add_people(session, 3)
+    assignment = await create_initial_assignment(session, date(2026, 1, 1), food_assignee.id)
+    for person in (admin, food_assignee, supply_assignee):
+        await add_supply_queue_member(session, SupplyType.BREAD, person.id)
+    await set_supply_current_user(session, SupplyType.BREAD, supply_assignee.id)
+    task = await open_supply_task(session, SupplyType.BREAD, admin.id)
+    await set_active_room(session, -1001234567890, "Xonadoshlar", admin.id)
+    now = datetime(2026, 1, 1, 10, tzinfo=UTC)
+
+    targets = await active_manual_reminder_targets(session, assignment.duty_date, now)
+    references = [(target.kind, target.reference_id) for target in targets]
+    result = await queue_manual_reminders(session, admin.id, assignment.duty_date, references, now)
+    logs = list((await session.scalars(select(ManualReminderLog).order_by(ManualReminderLog.id))).all())
+
+    assert {(target.kind, target.reference_id) for target in targets} == {
+        ("food", assignment.id),
+        ("supply", task.id),
+    }
+    assert result.target_count == 2
+    assert result.skipped_cooldown_count == 0
+    assert len(logs) == 4
+    assert {log.channel for log in logs} == {ManualReminderChannel.DIRECT, ManualReminderChannel.GROUP}
+    assert {log.chat_id for log in logs if log.channel == ManualReminderChannel.GROUP} == {-1001234567890}
+
+    repeated = await queue_manual_reminders(
+        session,
+        admin.id,
+        assignment.duty_date,
+        [("food", assignment.id)],
+        now + timedelta(minutes=10),
+    )
+
+    assert repeated.target_count == 0
+    assert repeated.skipped_cooldown_count == 1
+
+
+@pytest.mark.asyncio
+async def test_manual_reminder_dispatch_sends_to_private_chat_and_group(session, monkeypatch):
+    admin, assignee = await add_people(session, 2)
+    assignment = await create_initial_assignment(session, date(2026, 1, 1), assignee.id)
+    await set_active_room(session, -1001234567890, "Xonadoshlar", admin.id)
+    result = await queue_manual_reminders(
+        session,
+        admin.id,
+        assignment.duty_date,
+        [("food", assignment.id)],
+        datetime(2026, 1, 1, 10, tzinfo=UTC),
+    )
+
+    class RecordingBot:
+        def __init__(self) -> None:
+            self.messages: list[tuple[int, str]] = []
+
+        async def send_message(self, chat_id: int, text: str, **kwargs) -> None:
+            self.messages.append((chat_id, text))
+
+    factory = async_sessionmaker(session.bind, expire_on_commit=False)
+    monkeypatch.setattr(scheduler_module, "SessionFactory", factory)
+    bot = RecordingBot()
+    scheduler = DutyScheduler(
+        bot,
+        Settings(bot_token="test-token", database_url="sqlite+aiosqlite://", timezone="Asia/Tashkent"),
+    )
+
+    delivered, failed = await scheduler.dispatch_manual_reminders(result.log_ids)
+
+    assert (delivered, failed) == (2, 0)
+    assert {chat_id for chat_id, _ in bot.messages} == {assignee.telegram_id, -1001234567890}
+    assert any("Sizda bugungi ovqat navbati bor" in text for _, text in bot.messages)
+    assert any("bugungi ovqat navbati sizda" in text for _, text in bot.messages)

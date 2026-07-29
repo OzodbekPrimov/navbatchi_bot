@@ -20,8 +20,8 @@ async def main() -> None:
     await create_schema()
     bot = Bot(settings.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dispatcher = Dispatcher()
-    dispatcher.include_router(build_router(settings))
     scheduler = DutyScheduler(bot, settings)
+    dispatcher.include_router(build_router(settings, scheduler.dispatch_manual_reminders))
     scheduler_task = asyncio.create_task(scheduler.run(), name="duty-scheduler")
     try:
         await dispatcher.start_polling(bot, allowed_updates=dispatcher.resolve_used_update_types())

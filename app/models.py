@@ -4,6 +4,7 @@ from datetime import UTC, date, datetime
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    CheckConstraint,
     Date,
     DateTime,
     Enum,
@@ -87,6 +88,11 @@ class SupplyNotificationKind(str, enum.Enum):
     ASSIGNMENT_DIRECT = "assignment_direct"
     ASSIGNMENT_GROUP = "assignment_group"
     POLL = "poll"
+
+
+class ManualReminderChannel(str, enum.Enum):
+    DIRECT = "direct"
+    GROUP = "group"
 
 
 class User(Base):
@@ -324,6 +330,40 @@ class SupplyNotificationLog(Base):
         ForeignKey("users.id", ondelete="RESTRICT"), nullable=True
     )
     chat_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    is_terminal: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+
+class ManualReminderLog(Base):
+    """Durable outbox record for an admin-triggered reminder delivery."""
+
+    __tablename__ = "manual_reminder_logs"
+    __table_args__ = (
+        CheckConstraint(
+            "(food_assignment_id IS NOT NULL AND supply_task_id IS NULL) "
+            "OR (food_assignment_id IS NULL AND supply_task_id IS NOT NULL)",
+            name="ck_manual_reminder_exactly_one_target",
+        ),
+        Index("ix_manual_reminder_pending", "sent_at", "is_terminal", "next_attempt_at"),
+        Index("ix_manual_reminder_food_created", "food_assignment_id", "created_at"),
+        Index("ix_manual_reminder_supply_created", "supply_task_id", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    initiated_by_user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"))
+    recipient_user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"))
+    food_assignment_id: Mapped[int | None] = mapped_column(
+        ForeignKey("food_assignments.id", ondelete="CASCADE"), nullable=True
+    )
+    supply_task_id: Mapped[int | None] = mapped_column(
+        ForeignKey("supply_tasks.id", ondelete="CASCADE"), nullable=True
+    )
+    channel: Mapped[ManualReminderChannel] = mapped_column(Enum(ManualReminderChannel))
+    chat_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)

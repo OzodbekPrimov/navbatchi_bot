@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 from aiogram import Bot
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError, TelegramForbiddenError
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from sqlalchemy import select
 
 from app.config import Settings
@@ -18,6 +19,7 @@ from app.models import (
     CompletionPoll,
     FoodAssignment,
     GroupNotificationKind,
+    ManualReminderChannel,
     NotificationKind,
     PollStatus,
     SupplyNotificationKind,
@@ -32,16 +34,19 @@ from app.services import (
     active_queue,
     active_room,
     active_room_users,
-    claim_supply_notification,
+    claim_manual_reminder,
     claim_notification,
+    claim_supply_notification,
     create_completion_poll,
     current_assignment,
     enqueue_group_notification,
     expire_supply_transfers,
     finish_group_notification,
+    finish_manual_reminder,
     finish_notification,
     finish_supply_notification,
     pending_group_notifications,
+    pending_manual_reminder_log_ids,
     poll_has_no_activity,
     resolve_poll,
     resolve_supply_poll,
@@ -115,6 +120,110 @@ class DutyScheduler:
         await self._send_supply_poll_messages(now)
         await self._send_open_poll_messages(now)
         await self._send_due_reminders(local_now)
+        await self.dispatch_manual_reminders()
+
+    async def dispatch_manual_reminders(self, log_ids: list[int] | None = None) -> tuple[int, int]:
+        """Deliver manual-reminder outbox records now; retries are handled by tick()."""
+        async with SessionFactory() as session:
+            pending_ids = await pending_manual_reminder_log_ids(session, log_ids=log_ids)
+
+        delivered = 0
+        failed = 0
+        for log_id in pending_ids:
+            async with SessionFactory() as session:
+                log = await claim_manual_reminder(session, log_id)
+                if log is None:
+                    continue
+                recipient = await session.get(User, log.recipient_user_id)
+                if recipient is None:
+                    await finish_manual_reminder(session, log, "Recipient no longer exists", terminal=True)
+                    failed += 1
+                    continue
+
+                markup = None
+                parse_mode = None
+                if log.food_assignment_id is not None:
+                    assignment = await session.get(FoodAssignment, log.food_assignment_id)
+                    is_current = bool(
+                        assignment
+                        and assignment.status == AssignmentStatus.ACTIVE
+                        and assignment.assigned_user_id == recipient.id
+                        and assignment.reported_done_at is None
+                    )
+                    direct_text = "🔔 Eslatma\n\nSizda bugungi ovqat navbati bor. Iltimos, bajargach tasdiqlang."
+                    group_text = (
+                        f'🔔 Eslatma: <a href="tg://user?id={recipient.telegram_id}">'
+                        f"{escape(recipient.full_name)}</a>, bugungi ovqat navbati sizda."
+                    )
+                    markup = InlineKeyboardMarkup(
+                        inline_keyboard=[
+                            [
+                                InlineKeyboardButton(
+                                    text="✅ Ovqat tayyorladim", callback_data=f"duty:done:{log.food_assignment_id}"
+                                )
+                            ]
+                        ]
+                    )
+                else:
+                    task = await session.get(SupplyTask, log.supply_task_id)
+                    is_current = bool(
+                        task
+                        and task.status == SupplyTaskStatus.AWAITING_DELIVERY
+                        and task.assigned_user_id == recipient.id
+                    )
+                    label = self._supply_label(task.supply_type) if task else "Ta’minot"
+                    direct_text = f"🔔 Eslatma\n\n{label} olib kelish navbati sizda. Iltimos, bajargach tasdiqlang."
+                    group_text = (
+                        f'🔔 Eslatma: <a href="tg://user?id={recipient.telegram_id}">'
+                        f"{escape(recipient.full_name)}</a>, {label.lower()} olib kelish navbati sizda."
+                    )
+                    markup = InlineKeyboardMarkup(
+                        inline_keyboard=[
+                            [
+                                InlineKeyboardButton(
+                                    text="✅ Olib keldim", callback_data=f"supply:done:{log.supply_task_id}"
+                                )
+                            ],
+                            [
+                                InlineKeyboardButton(
+                                    text="🔄 Navbatni o‘tkazish",
+                                    callback_data=f"supply:transfer:{log.supply_task_id}",
+                                )
+                            ],
+                        ]
+                    )
+                if not is_current:
+                    await finish_manual_reminder(session, log, "Target is no longer active", terminal=True)
+                    failed += 1
+                    continue
+
+                if log.channel == ManualReminderChannel.DIRECT:
+                    chat_id = recipient.telegram_id
+                    text = direct_text
+                else:
+                    room = await active_room(session)
+                    if room is None or room.chat_id != log.chat_id:
+                        await finish_manual_reminder(session, log, "Active group changed or disconnected", terminal=True)
+                        failed += 1
+                        continue
+                    chat_id = log.chat_id
+                    text = group_text
+                    markup = None
+                    parse_mode = ParseMode.HTML
+
+                try:
+                    await self.bot.send_message(chat_id, text, reply_markup=markup, parse_mode=parse_mode)
+                except TelegramForbiddenError as error:
+                    await finish_manual_reminder(session, log, str(error), terminal=True)
+                    failed += 1
+                except TelegramAPIError as error:
+                    await finish_manual_reminder(session, log, str(error))
+                    logger.warning("Could not send manual reminder %s: %s", log.id, error)
+                    failed += 1
+                else:
+                    await finish_manual_reminder(session, log)
+                    delivered += 1
+        return delivered, failed
 
     async def _send_due_reminders(self, local_now: datetime) -> None:
         reminder_slots = (

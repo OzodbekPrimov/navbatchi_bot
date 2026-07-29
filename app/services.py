@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
@@ -14,6 +15,8 @@ from app.models import (
     FoodQueueMember,
     GroupNotificationKind,
     GroupNotificationLog,
+    ManualReminderChannel,
+    ManualReminderLog,
     NotificationKind,
     NotificationLog,
     PollStatus,
@@ -43,8 +46,33 @@ class DomainError(Exception):
     """A business-rule error that can be shown to a bot user."""
 
 
+MANUAL_REMINDER_COOLDOWN = timedelta(minutes=30)
+
+
+@dataclass(frozen=True)
+class ManualReminderTarget:
+    kind: str
+    reference_id: int
+    user_id: int
+    user_name: str
+    label: str
+    cooldown_until: datetime | None
+
+
+@dataclass(frozen=True)
+class ManualReminderQueueResult:
+    log_ids: list[int]
+    target_count: int
+    skipped_cooldown_count: int
+
+
 def utc_now() -> datetime:
     return datetime.now(UTC)
+
+
+def _as_utc(value: datetime) -> datetime:
+    """SQLite returns naive datetimes even for timezone-aware columns."""
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
 
 
 async def get_or_create_user(
@@ -278,6 +306,179 @@ async def active_room(session: AsyncSession) -> RoomSetting | None:
     return await session.scalar(
         select(RoomSetting).where(RoomSetting.is_active.is_(True)).order_by(RoomSetting.id.desc())
     )
+
+
+async def _manual_reminder_cooldown_until(
+    session: AsyncSession, kind: str, reference_id: int, now: datetime
+) -> datetime | None:
+    target_column = (
+        ManualReminderLog.food_assignment_id if kind == "food" else ManualReminderLog.supply_task_id
+    )
+    latest = await session.scalar(
+        select(ManualReminderLog.created_at)
+        .where(target_column == reference_id, ManualReminderLog.created_at > now - MANUAL_REMINDER_COOLDOWN)
+        .order_by(ManualReminderLog.created_at.desc())
+        .limit(1)
+    )
+    return _as_utc(latest) + MANUAL_REMINDER_COOLDOWN if latest else None
+
+
+async def active_manual_reminder_targets(
+    session: AsyncSession, duty_date: date, now: datetime | None = None
+) -> list[ManualReminderTarget]:
+    """Return reminder-eligible tasks and their per-task cooldown state."""
+    now = now or utc_now()
+    targets: list[ManualReminderTarget] = []
+    assignment = await current_assignment(session, duty_date)
+    if assignment and assignment.reported_done_at is None:
+        assignee = await session.get(User, assignment.assigned_user_id)
+        if assignee:
+            targets.append(
+                ManualReminderTarget(
+                    kind="food",
+                    reference_id=assignment.id,
+                    user_id=assignee.id,
+                    user_name=assignee.full_name,
+                    label="🍽 Ovqat",
+                    cooldown_until=await _manual_reminder_cooldown_until(session, "food", assignment.id, now),
+                )
+            )
+
+    tasks = list(
+        (
+            await session.scalars(
+                select(SupplyTask)
+                .join(SupplyActiveTask, SupplyActiveTask.task_id == SupplyTask.id)
+                .where(SupplyTask.status == SupplyTaskStatus.AWAITING_DELIVERY)
+                .order_by(SupplyTask.supply_type)
+            )
+        ).all()
+    )
+    for task in tasks:
+        assignee = await session.get(User, task.assigned_user_id)
+        if assignee is None:
+            continue
+        label = "🥖 Non" if task.supply_type == SupplyType.BREAD else "💧 Suv"
+        targets.append(
+            ManualReminderTarget(
+                kind="supply",
+                reference_id=task.id,
+                user_id=assignee.id,
+                user_name=assignee.full_name,
+                label=label,
+                cooldown_until=await _manual_reminder_cooldown_until(session, "supply", task.id, now),
+            )
+        )
+    return targets
+
+
+async def queue_manual_reminders(
+    session: AsyncSession,
+    initiator_user_id: int,
+    duty_date: date,
+    references: list[tuple[str, int]],
+    now: datetime | None = None,
+) -> ManualReminderQueueResult:
+    """Create direct and group outbox rows, enforcing the reminder cooldown."""
+    now = now or utc_now()
+    room = await active_room(session)
+    if room is None:
+        raise DomainError("Avval faol Telegram guruhini ulang.")
+    active_targets = {
+        (target.kind, target.reference_id): target
+        for target in await active_manual_reminder_targets(session, duty_date, now)
+    }
+    unique_references = list(dict.fromkeys(references))
+    if not unique_references:
+        raise DomainError("Eslatish uchun faol navbatchi yo‘q.")
+    missing = [reference for reference in unique_references if reference not in active_targets]
+    if missing:
+        raise DomainError("Tanlangan navbatchi endi eslatish uchun faol emas.")
+
+    log_ids: list[int] = []
+    skipped = 0
+    for reference in unique_references:
+        target = active_targets[reference]
+        if target.cooldown_until and target.cooldown_until > now:
+            skipped += 1
+            continue
+        food_assignment_id = target.reference_id if target.kind == "food" else None
+        supply_task_id = target.reference_id if target.kind == "supply" else None
+        direct_log = ManualReminderLog(
+            initiated_by_user_id=initiator_user_id,
+            recipient_user_id=target.user_id,
+            food_assignment_id=food_assignment_id,
+            supply_task_id=supply_task_id,
+            channel=ManualReminderChannel.DIRECT,
+            created_at=now,
+        )
+        group_log = ManualReminderLog(
+            initiated_by_user_id=initiator_user_id,
+            recipient_user_id=target.user_id,
+            food_assignment_id=food_assignment_id,
+            supply_task_id=supply_task_id,
+            channel=ManualReminderChannel.GROUP,
+            chat_id=room.chat_id,
+            created_at=now,
+        )
+        session.add_all((direct_log, group_log))
+        await session.flush()
+        log_ids.extend((direct_log.id, group_log.id))
+    await session.commit()
+    return ManualReminderQueueResult(
+        log_ids=log_ids,
+        target_count=len(log_ids) // 2,
+        skipped_cooldown_count=skipped,
+    )
+
+
+async def pending_manual_reminder_log_ids(
+    session: AsyncSession, now: datetime | None = None, log_ids: list[int] | None = None
+) -> list[int]:
+    now = now or utc_now()
+    conditions = [
+        ManualReminderLog.sent_at.is_(None),
+        ManualReminderLog.is_terminal.is_(False),
+        (ManualReminderLog.next_attempt_at.is_(None) | (ManualReminderLog.next_attempt_at <= now)),
+    ]
+    if log_ids is not None:
+        conditions.append(ManualReminderLog.id.in_(log_ids))
+    return list((await session.scalars(select(ManualReminderLog.id).where(*conditions))).all())
+
+
+async def claim_manual_reminder(
+    session: AsyncSession, log_id: int, now: datetime | None = None
+) -> ManualReminderLog | None:
+    now = now or utc_now()
+    log = await session.scalar(
+        select(ManualReminderLog).where(ManualReminderLog.id == log_id).with_for_update()
+    )
+    if log is None or log.sent_at or log.is_terminal or (
+        log.next_attempt_at and _as_utc(log.next_attempt_at) > now
+    ):
+        return None
+    # Reserve the record while Telegram is called so two scheduler ticks cannot send it twice.
+    log.next_attempt_at = now + timedelta(minutes=2)
+    await session.commit()
+    return log
+
+
+async def finish_manual_reminder(
+    session: AsyncSession,
+    log: ManualReminderLog,
+    error: str | None = None,
+    terminal: bool = False,
+) -> None:
+    if error:
+        log.error = error
+        log.attempts += 1
+        log.is_terminal = terminal
+        log.next_attempt_at = utc_now() + timedelta(minutes=min(5 * log.attempts, 60))
+    else:
+        log.sent_at = utc_now()
+        log.error = None
+        log.next_attempt_at = None
+    await session.commit()
 
 
 async def enqueue_group_notification(

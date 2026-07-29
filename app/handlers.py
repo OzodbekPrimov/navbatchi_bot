@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from datetime import date, datetime
 from html import escape
 from zoneinfo import ZoneInfo
@@ -41,6 +42,7 @@ from app.models import (
 )
 from app.services import (
     DomainError,
+    active_manual_reminder_targets,
     active_queue,
     active_supply_queue,
     add_queue_member,
@@ -63,6 +65,7 @@ from app.services import (
     move_queue_member,
     move_supply_queue_member,
     open_supply_task,
+    queue_manual_reminders,
     reassign_supply_task,
     reassign_today,
     remove_queue_member,
@@ -75,7 +78,10 @@ from app.services import (
 from app.states import TransferStates
 
 
-def build_router(settings: Settings) -> Router:
+def build_router(
+    settings: Settings,
+    dispatch_manual_reminders: Callable[[list[int] | None], Awaitable[tuple[int, int]]],
+) -> Router:
     router = Router(name="food-duty")
     zone = ZoneInfo(settings.timezone)
 
@@ -133,6 +139,7 @@ def build_router(settings: Settings) -> Router:
                 [InlineKeyboardButton(text="📦 Non va suv navbati", callback_data="supadm:menu")],
                 [InlineKeyboardButton(text="▶️ Navbatni boshlash", callback_data="adm:start")],
                 [InlineKeyboardButton(text="📍 Bugungi navbatchini almashtirish", callback_data="adm:today")],
+                [InlineKeyboardButton(text="🔔 Eslatmalar", callback_data="adm:reminders")],
             ]
         )
         await callback.message.answer("Admin boshqaruvi:", reply_markup=keyboard)
@@ -732,6 +739,7 @@ def build_router(settings: Settings) -> Router:
                 ],
                 [InlineKeyboardButton(text="▶️ Navbatni boshlash", callback_data="adm:start")],
                 [InlineKeyboardButton(text="📍 Bugungi navbatchini almashtirish", callback_data="adm:today")],
+                [InlineKeyboardButton(text="🔔 Eslatmalar", callback_data="adm:reminders")],
             ]
         )
         await message.answer("Admin boshqaruvi:", reply_markup=keyboard)
@@ -749,6 +757,7 @@ def build_router(settings: Settings) -> Router:
                     [InlineKeyboardButton(text="🍽 Ovqat navbati", callback_data="adm:queue")],
                     [InlineKeyboardButton(text="📦 Non va suv navbati", callback_data="supadm:menu")],
                     [InlineKeyboardButton(text="👥 Qatnashchilar", callback_data="adm:members")],
+                    [InlineKeyboardButton(text="🔔 Eslatmalar", callback_data="adm:reminders")],
                 ]
             )
             await callback.message.answer(
@@ -756,6 +765,165 @@ def build_router(settings: Settings) -> Router:
             )
             await callback.answer()
         except DomainError as error:
+            await callback.answer(str(error), show_alert=True)
+
+    async def reminder_panel() -> tuple[str, InlineKeyboardMarkup]:
+        async with SessionFactory() as session:
+            targets = await active_manual_reminder_targets(session, today_local())
+        if not targets:
+            return (
+                "🔔 <b>Eslatmalar</b>\n\nEslatish uchun faol navbatchi yo‘q.",
+                InlineKeyboardMarkup(
+                    inline_keyboard=[[InlineKeyboardButton(text="‹ Admin", callback_data="adm:overview")]]
+                ),
+            )
+        lines = ["🔔 <b>Faol eslatmalar</b>"]
+        buttons: list[list[InlineKeyboardButton]] = []
+        available_count = 0
+        for target in targets:
+            cooldown = (
+                f" — ⏳ {target.cooldown_until.astimezone(zone).strftime('%H:%M')} gacha"
+                if target.cooldown_until
+                else ""
+            )
+            lines.append(f"{target.label}: {escape(target.user_name)}{cooldown}")
+            if target.cooldown_until:
+                buttons.append(
+                    [InlineKeyboardButton(text=f"⏳ {target.label}", callback_data="ignore")]
+                )
+            else:
+                available_count += 1
+                buttons.append(
+                    [
+                        InlineKeyboardButton(
+                            text=f"🔔 {target.label} — {target.user_name[:30]}",
+                            callback_data=f"rem:one:{target.kind}:{target.reference_id}",
+                        )
+                    ]
+                )
+        if available_count:
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        text="📣 Barcha faol navbatchilarga", callback_data="rem:all"
+                    )
+                ]
+            )
+        buttons.append([InlineKeyboardButton(text="‹ Admin", callback_data="adm:overview")])
+        return "\n\n".join(("\n".join(lines), "Shaxsiy chat va guruhga yuboriladi.")), InlineKeyboardMarkup(
+            inline_keyboard=buttons
+        )
+
+    @router.callback_query(F.data == "adm:reminders")
+    async def admin_reminders(callback: CallbackQuery) -> None:
+        try:
+            await require_admin(callback)
+            text, markup = await reminder_panel()
+            await callback.message.answer(text, reply_markup=markup)
+            await callback.answer()
+        except DomainError as error:
+            await callback.answer(str(error), show_alert=True)
+
+    @router.callback_query(F.data.startswith("rem:one:"))
+    async def reminder_one_confirm(callback: CallbackQuery) -> None:
+        try:
+            await require_admin(callback)
+            _, _, kind, raw_reference_id = callback.data.split(":")
+            reference = (kind, int(raw_reference_id))
+            async with SessionFactory() as session:
+                targets = await active_manual_reminder_targets(session, today_local())
+            target = next(
+                (item for item in targets if (item.kind, item.reference_id) == reference), None
+            )
+            if target is None:
+                raise DomainError("Tanlangan navbatchi endi faol emas.")
+            if target.cooldown_until:
+                raise DomainError("Bu vazifa uchun eslatma limiti hali tugamagan.")
+            markup = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="✅ Yuborish",
+                            callback_data=f"rem:confirm:one:{kind}:{target.reference_id}",
+                        ),
+                        InlineKeyboardButton(text="Bekor qilish", callback_data="adm:reminders"),
+                    ]
+                ]
+            )
+            await callback.message.edit_text(
+                f"🔔 {target.label} — <b>{escape(target.user_name)}</b> ga eslatma yuborilsinmi?\n\n"
+                "Xabar shaxsiy chatiga va guruhga yuboriladi.",
+                reply_markup=markup,
+            )
+            await callback.answer()
+        except (DomainError, ValueError) as error:
+            await callback.answer(str(error), show_alert=True)
+
+    @router.callback_query(F.data == "rem:all")
+    async def reminder_all_confirm(callback: CallbackQuery) -> None:
+        try:
+            await require_admin(callback)
+            async with SessionFactory() as session:
+                targets = await active_manual_reminder_targets(session, today_local())
+            ready = [target for target in targets if target.cooldown_until is None]
+            if not ready:
+                raise DomainError("Hozir eslatish mumkin bo‘lgan faol navbatchi yo‘q.")
+            names = "\n".join(f"• {target.label}: {escape(target.user_name)}" for target in ready)
+            markup = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(text="✅ Barchasiga yuborish", callback_data="rem:confirm:all"),
+                        InlineKeyboardButton(text="Bekor qilish", callback_data="adm:reminders"),
+                    ]
+                ]
+            )
+            await callback.message.edit_text(
+                f"📣 <b>{len(ready)} ta faol navbatchiga</b> eslatma yuborilsinmi?\n\n{names}\n\n"
+                "Har biriga shaxsiy chatda va guruhda xabar boradi.",
+                reply_markup=markup,
+            )
+            await callback.answer()
+        except DomainError as error:
+            await callback.answer(str(error), show_alert=True)
+
+    @router.callback_query(F.data.startswith("rem:confirm:"))
+    async def reminder_send(callback: CallbackQuery) -> None:
+        try:
+            admin = await require_admin(callback)
+            parts = callback.data.split(":")
+            async with SessionFactory() as session:
+                targets = await active_manual_reminder_targets(session, today_local())
+                if parts[2] == "all":
+                    references = [
+                        (target.kind, target.reference_id)
+                        for target in targets
+                        if target.cooldown_until is None
+                    ]
+                elif len(parts) == 5 and parts[2] == "one":
+                    reference = (parts[3], int(parts[4]))
+                    references = [reference]
+                else:
+                    raise ValueError
+                result = await queue_manual_reminders(session, admin.id, today_local(), references)
+            delivered, failed = await dispatch_manual_reminders(result.log_ids)
+            if result.target_count == 0:
+                await callback.message.edit_text(
+                    "⏳ Eslatma yuborilmadi: tanlangan vazifalar uchun 30 daqiqalik limit faollashgan."
+                )
+                await callback.answer()
+                return
+            text = (
+                f"✅ {result.target_count} ta navbatchi uchun eslatma navbatga qo‘shildi.\n"
+                f"Yuborildi: {delivered} ta kanal."
+            )
+            if result.skipped_cooldown_count:
+                text += f"\n⏳ Limit sabab o‘tkazib yuborildi: {result.skipped_cooldown_count} ta vazifa."
+            if failed:
+                text += "\n⚠️ Ayrim xabarlar yuborilmadi; bot keyinroq qayta urinadi."
+            text += "\n\nYuborishlar audit jurnalida saqlanadi."
+            await callback.message.edit_text(text)
+            await callback.answer()
+        except (DomainError, ValueError) as error:
             await callback.answer(str(error), show_alert=True)
 
     @router.callback_query(F.data == "supadm:menu")

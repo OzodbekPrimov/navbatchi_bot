@@ -86,6 +86,10 @@ Guruh e’lonlari va o‘zgarishlar bazada alohida loglanadi. Shu sabab server r
 
 `📜 Tarix` menyusi ovqat, suv va non uchun yakunlangan vazifalarni alohida bo‘limlarda chiqaradi. Har bo‘limda oxirgi 10 ta yozuv va eski yozuvlarga o‘tish tugmalari bo‘ladi; transfer yuz berganda rejalashtirilgan hamda amalda bajargan xonadosh ko‘rsatiladi.
 
+## Qo‘lda eslatma
+
+`⚙️ Admin → 🔔 Eslatmalar` orqali admin ayni paytdagi ovqat, non yoki suv navbatchisiga, yoxud barcha faol navbatchilarga eslatma yuboradi. Har eslatma navbatchining shaxsiy chatiga va faol guruhga alohida yetkaziladi. Bir vazifa uchun qo‘lda yuborish 30 daqiqada bir marta bilan cheklanadi; Telegram xatosida xabar outbox orqali qayta yuboriladi.
+
 ## Loyihadagi muhim qismlar
 
 - `app/models.py` — PostgreSQL sxemasi.
