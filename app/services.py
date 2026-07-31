@@ -730,12 +730,8 @@ async def resolve_supply_poll(session: AsyncSession, poll: SupplyVerificationPol
             SupplyPollVote.poll_id == poll.id, SupplyPollVote.value == VoteValue.NO
         )
     ) or 0
-    yes_votes = await session.scalar(
-        select(func.count(SupplyPollVote.id)).where(
-            SupplyPollVote.poll_id == poll.id, SupplyPollVote.value == VoteValue.YES
-        )
-    ) or 0
-    passed = no_votes < 2 and (yes_votes > 0 or no_votes == 0)
+    # A single objection keeps the task with the current assignee.
+    passed = no_votes == 0
     poll.status = SupplyPollStatus.CLOSED
     if passed:
         state = await session.get(SupplyRotationState, task.supply_type, with_for_update=True)
@@ -978,9 +974,9 @@ async def resolve_poll(session: AsyncSession, poll: CompletionPoll, now: datetim
     yes_votes = await session.scalar(
         select(func.count(PollVote.id)).where(PollVote.poll_id == poll.id, PollVote.value == VoteValue.YES)
     ) or 0
-    # A self-report is enough only when nobody objects or votes. One "No" still needs a
-    # positive confirmation from another roommate; two "No" votes always repeat the duty.
-    passed = no_votes < 2 and (yes_votes > 0 or (no_votes == 0 and assignment.reported_done_at is not None))
+    # A single objection always repeats the duty. Without objections, a positive vote or
+    # the duty holder's self-report is enough to advance the rotation.
+    passed = no_votes == 0 and (yes_votes > 0 or assignment.reported_done_at is not None)
     assignment.status = AssignmentStatus.COMPLETED if passed else AssignmentStatus.NOT_COMPLETED
     assignment.resolved_at = now
     poll.status = PollStatus.CLOSED

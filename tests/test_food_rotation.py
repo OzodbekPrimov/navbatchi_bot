@@ -88,13 +88,13 @@ async def test_a_yes_vote_advances_to_the_next_scheduled_person(session):
 
 
 @pytest.mark.asyncio
-async def test_two_no_votes_keep_the_same_person_on_duty(session):
+async def test_one_no_vote_keeps_the_same_person_on_duty_even_with_a_yes_vote(session):
     first, second, third = await add_people(session, 3)
     assignment = await create_initial_assignment(session, date(2026, 1, 1), first.id)
     poll = await create_completion_poll(session, assignment, "Asia/Tashkent")
     before_close = poll.closes_at - timedelta(seconds=1)
     await cast_vote(session, poll.id, second.id, VoteValue.NO, now=before_close)
-    await cast_vote(session, poll.id, third.id, VoteValue.NO, now=before_close)
+    await cast_vote(session, poll.id, third.id, VoteValue.YES, now=before_close)
 
     await resolve_poll(session, poll, now=poll.closes_at + timedelta(seconds=1))
     tomorrow = await get_assignment_for_date(session, date(2026, 1, 2))
@@ -181,7 +181,7 @@ async def test_supply_task_advances_only_after_delivery_verification(session):
 
 
 @pytest.mark.asyncio
-async def test_two_supply_no_votes_keep_the_same_task_open(session):
+async def test_one_supply_no_vote_keeps_the_same_task_open_even_with_a_yes_vote(session):
     first, second, third = await add_people(session, 3)
     for person in (first, second, third):
         await add_supply_queue_member(session, SupplyType.WATER, person.id)
@@ -191,7 +191,7 @@ async def test_two_supply_no_votes_keep_the_same_task_open(session):
     poll = await report_supply_brought(session, task.id, first.id)
     before_close = poll.closes_at - timedelta(seconds=1)
     await cast_supply_vote(session, poll.id, second.id, VoteValue.NO, now=before_close)
-    await cast_supply_vote(session, poll.id, third.id, VoteValue.NO, now=before_close)
+    await cast_supply_vote(session, poll.id, third.id, VoteValue.YES, now=before_close)
     assert await resolve_supply_poll(session, poll, now=poll.closes_at + timedelta(seconds=1)) is False
 
     state = await session.get(SupplyRotationState, SupplyType.WATER)
