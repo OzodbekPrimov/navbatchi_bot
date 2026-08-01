@@ -26,6 +26,8 @@ from app.models import (
 from app.scheduler import DutyScheduler
 from app.services import (
     active_manual_reminder_targets,
+    active_queue,
+    active_supply_queue,
     add_queue_member,
     add_supply_queue_member,
     cast_supply_vote,
@@ -34,6 +36,8 @@ from app.services import (
     create_completion_poll,
     create_initial_assignment,
     create_supply_transfer,
+    create_transfer_request,
+    decide_transfer,
     decide_supply_transfer,
     enqueue_group_notification,
     food_history_page,
@@ -201,7 +205,7 @@ async def test_one_supply_no_vote_keeps_the_same_task_open_even_with_a_yes_vote(
 
 
 @pytest.mark.asyncio
-async def test_supply_transfer_advances_after_the_effective_delivery_person(session):
+async def test_supply_transfer_moves_effective_delivery_person_to_queue_tail(session):
     first, second, third = await add_people(session, 3)
     for person in (first, second, third):
         await add_supply_queue_member(session, SupplyType.BREAD, person.id)
@@ -219,7 +223,34 @@ async def test_supply_transfer_advances_after_the_effective_delivery_person(sess
 
     state = await session.get(SupplyRotationState, SupplyType.BREAD)
     assert state is not None
-    assert state.current_user_id == third.id
+    assert state.current_user_id == first.id
+    assert [person.id for _, person in await active_supply_queue(session, SupplyType.BREAD)] == [
+        first.id,
+        third.id,
+        second.id,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_food_transfer_moves_effective_duty_holder_to_queue_tail(session):
+    first, second, third, fourth = await add_people(session, 4)
+    assignment = await create_initial_assignment(session, date(2026, 1, 1), first.id)
+    request = await create_transfer_request(session, assignment, first.id, third.id, None)
+    await decide_transfer(session, request.id, third.id, accepted=True)
+    poll = await create_completion_poll(session, assignment, "Asia/Tashkent")
+    await cast_vote(session, poll.id, second.id, VoteValue.YES, now=poll.closes_at - timedelta(seconds=1))
+
+    await resolve_poll(session, poll, now=poll.closes_at + timedelta(seconds=1))
+    tomorrow = await get_assignment_for_date(session, date(2026, 1, 2))
+
+    assert tomorrow is not None
+    assert tomorrow.scheduled_user_id == second.id
+    assert [person.id for _, person in await active_queue(session)] == [
+        second.id,
+        first.id,
+        fourth.id,
+        third.id,
+    ]
 
 
 @pytest.mark.asyncio

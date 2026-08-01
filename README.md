@@ -29,7 +29,11 @@ Bot bitta process bo‘lib ishlaydi. Scheduler xabar yuborilganini bazada qayd q
   - ovoz bo‘lmasa, lekin navbatchi tayyorlaganini tasdiqlagan bo‘lsa — ertaga keyingi odam;
   - ovoz ham, navbatchining tasdig‘i ham bo‘lmasa — ertaga yana o‘sha odam va admin ogohlantiriladi.
 - Har odam bitta ovozga ega; tugmani qayta bosib o‘z ovozini o‘zgartirishi mumkin.
-- Transfer faqat bugungi vazifani o‘zgartiradi. Doimiy navbat tartibi o‘zgarmaydi.
+- Transfer qabul qilinib, vazifa muvaffaqiyatli yakunlansa, amalda bajargan xonadosh
+  navbatning oxiriga o‘tadi. Transferni yuborgan xonadosh qabul qiluvchining avvalgi
+  o‘rniga joylashadi. Masalan, `Ozod → Jamshid → Ismoil → Omadbek` tartibida Ozod
+  bugungi vazifani Ismoilga bersa va Ismoil bajarsa, yangi tartib
+  `Jamshid → Ozod → Omadbek → Ismoil` bo‘ladi.
 
 ### Non va suv navbati
 
@@ -41,6 +45,8 @@ Bot bitta process bo‘lib ishlaydi. Scheduler xabar yuborilganini bazada qayd q
   - kamida 1 ta `Yo‘q` — vazifa o‘sha odamda qoladi;
   - `Yo‘q` bo‘lmasa va kamida 1 ta `Ha` bo‘lsa — navbat keyingi odamga siljiydi;
   - ovoz bo‘lmasa — `Olib keldim` tasdig‘i asosida navbat siljiydi.
+- Tekshiruv muvaffaqiyatli yakunlanganda non yoki suvni amalda olib kelgan odam ham
+  navbatning oxiriga o‘tadi; transferdagi tartib qoidasi ovqat navbati bilan bir xil.
 - Transfer faqat tekshiruv boshlanishidan oldin mumkin. Qabul qilinsa, eski va yangi navbatchi shaxsiy xabar oladi, guruhda ikkalasi mention bilan e’lon qilinadi. So‘rov 15 daqiqada qabul qilinmasa avtomatik bekor bo‘ladi.
 - Admin tekshiruv boshlanmaguncha `Faol vazifani almashtirish` orqali non yoki suv vazifasini bevosita boshqa navbatchiga bera oladi.
 

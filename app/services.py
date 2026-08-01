@@ -244,6 +244,37 @@ async def _next_queue_user(session: AsyncSession, scheduled_user_id: int) -> int
     return active[0][0].user_id
 
 
+async def _rotate_food_queue_after_completion(
+    session: AsyncSession, scheduled_user_id: int, completed_user_id: int
+) -> int:
+    """Move the effective duty holder to the tail and return tomorrow's first user.
+
+    If a duty was transferred, the scheduled user takes the effective holder's
+    old place. This preserves the sender's remaining turn while ensuring the
+    person who actually completed the work waits for every other member.
+    """
+    entries = await active_queue(session)
+    members = {member.user_id: member for member, _ in entries}
+    user_ids = [member.user_id for member, _ in entries]
+    if scheduled_user_id not in members or completed_user_id not in members:
+        raise DomainError("Navbatchi faol ovqat navbatida yo‘q.")
+
+    scheduled_index = user_ids.index(scheduled_user_id)
+    next_order = user_ids[scheduled_index + 1 :] + user_ids[:scheduled_index]
+    if completed_user_id != scheduled_user_id:
+        completed_index = next_order.index(completed_user_id)
+        next_order[completed_index] = scheduled_user_id
+    next_order.append(completed_user_id)
+
+    # Positions are unique, so use temporary values while rewriting the order.
+    for member in members.values():
+        member.position = -(10_000 + member.id)
+    await session.flush()
+    for position, user_id in enumerate(next_order, start=1):
+        members[user_id].position = position
+    return next_order[0]
+
+
 async def get_assignment_for_date(session: AsyncSession, duty_date: date) -> FoodAssignment | None:
     return await session.scalar(select(FoodAssignment).where(FoodAssignment.duty_date == duty_date))
 
@@ -633,6 +664,34 @@ async def _next_supply_user(session: AsyncSession, supply_type: SupplyType, user
     return entries[0][0].user_id
 
 
+async def _rotate_supply_queue_after_completion(
+    session: AsyncSession,
+    supply_type: SupplyType,
+    scheduled_user_id: int,
+    completed_user_id: int,
+) -> int:
+    """Apply the same FIFO transfer rule used by the food queue."""
+    entries = await active_supply_queue(session, supply_type)
+    members = {member.user_id: member for member, _ in entries}
+    user_ids = [member.user_id for member, _ in entries]
+    if scheduled_user_id not in members or completed_user_id not in members:
+        raise DomainError("Navbatchi faol navbatda yo‘q.")
+
+    scheduled_index = user_ids.index(scheduled_user_id)
+    next_order = user_ids[scheduled_index + 1 :] + user_ids[:scheduled_index]
+    if completed_user_id != scheduled_user_id:
+        completed_index = next_order.index(completed_user_id)
+        next_order[completed_index] = scheduled_user_id
+    next_order.append(completed_user_id)
+
+    for member in members.values():
+        member.position = -(20_000 + member.id)
+    await session.flush()
+    for position, user_id in enumerate(next_order, start=1):
+        members[user_id].position = position
+    return next_order[0]
+
+
 async def _is_active_room_user(session: AsyncSession, user_id: int) -> bool:
     active_user_ids = union(
         select(FoodQueueMember.user_id).where(FoodQueueMember.is_active.is_(True)),
@@ -736,9 +795,12 @@ async def resolve_supply_poll(session: AsyncSession, poll: SupplyVerificationPol
     if passed:
         state = await session.get(SupplyRotationState, task.supply_type, with_for_update=True)
         assert state is not None
-        # A person who accepted a supply transfer has completed this turn, so the
-        # next supply turn starts after the effective delivery person.
-        state.current_user_id = await _next_supply_user(session, task.supply_type, task.assigned_user_id)
+        state.current_user_id = await _rotate_supply_queue_after_completion(
+            session,
+            task.supply_type,
+            task.scheduled_user_id,
+            task.assigned_user_id,
+        )
         task.status = SupplyTaskStatus.COMPLETED
         task.completed_at = now
         await session.execute(delete(SupplyActiveTask).where(SupplyActiveTask.supply_type == task.supply_type))
@@ -984,7 +1046,15 @@ async def resolve_poll(session: AsyncSession, poll: CompletionPoll, now: datetim
     tomorrow = assignment.duty_date + timedelta(days=1)
     next_assignment = await get_assignment_for_date(session, tomorrow)
     if next_assignment is None:
-        next_user_id = await _next_queue_user(session, assignment.scheduled_user_id) if passed else assignment.scheduled_user_id
+        next_user_id = (
+            await _rotate_food_queue_after_completion(
+                session,
+                assignment.scheduled_user_id,
+                assignment.assigned_user_id,
+            )
+            if passed
+            else assignment.scheduled_user_id
+        )
         next_assignment = FoodAssignment(
             duty_date=tomorrow, scheduled_user_id=next_user_id, assigned_user_id=next_user_id
         )
