@@ -109,7 +109,7 @@ async def test_one_no_vote_keeps_the_same_person_on_duty_even_with_a_yes_vote(se
 
 
 @pytest.mark.asyncio
-async def test_self_report_without_votes_advances_to_the_next_scheduled_person(session):
+async def test_self_report_without_votes_repeats_the_duty(session):
     first, second = await add_people(session, 2)
     assignment = await create_initial_assignment(session, date(2026, 1, 1), first.id)
     poll = await create_completion_poll(session, assignment, "Asia/Tashkent")
@@ -124,9 +124,9 @@ async def test_self_report_without_votes_advances_to_the_next_scheduled_person(s
     await resolve_poll(session, poll, now=poll.closes_at + timedelta(seconds=1))
     tomorrow = await get_assignment_for_date(session, date(2026, 1, 2))
 
-    assert assignment.status == AssignmentStatus.COMPLETED
+    assert assignment.status == AssignmentStatus.NOT_COMPLETED
     assert tomorrow is not None
-    assert tomorrow.scheduled_user_id == second.id
+    assert tomorrow.scheduled_user_id == first.id
 
 
 @pytest.mark.asyncio
@@ -141,6 +141,18 @@ async def test_no_votes_and_no_self_report_repeats_the_duty(session):
     assert assignment.status == AssignmentStatus.NOT_COMPLETED
     assert tomorrow is not None
     assert tomorrow.scheduled_user_id == first.id
+
+
+@pytest.mark.asyncio
+async def test_yes_vote_moves_completed_duty_holder_to_the_queue_tail(session):
+    first, second, third = await add_people(session, 3)
+    assignment = await create_initial_assignment(session, date(2026, 1, 1), first.id)
+    poll = await create_completion_poll(session, assignment, "Asia/Tashkent")
+    await cast_vote(session, poll.id, second.id, VoteValue.YES, now=poll.closes_at - timedelta(seconds=1))
+
+    await resolve_poll(session, poll, now=poll.closes_at + timedelta(seconds=1))
+
+    assert [person.id for _, person in await active_queue(session)] == [second.id, third.id, first.id]
 
 
 @pytest.mark.asyncio

@@ -1036,9 +1036,10 @@ async def resolve_poll(session: AsyncSession, poll: CompletionPoll, now: datetim
     yes_votes = await session.scalar(
         select(func.count(PollVote.id)).where(PollVote.poll_id == poll.id, PollVote.value == VoteValue.YES)
     ) or 0
-    # A single objection always repeats the duty. Without objections, a positive vote or
-    # the duty holder's self-report is enough to advance the rotation.
-    passed = no_votes == 0 and (yes_votes > 0 or assignment.reported_done_at is not None)
+    # The rotation advances only when at least one roommate confirms completion and
+    # nobody objects.  The duty holder's self-report is kept as supporting history,
+    # but must never advance the queue on its own.
+    passed = no_votes == 0 and yes_votes > 0
     assignment.status = AssignmentStatus.COMPLETED if passed else AssignmentStatus.NOT_COMPLETED
     assignment.resolved_at = now
     poll.status = PollStatus.CLOSED

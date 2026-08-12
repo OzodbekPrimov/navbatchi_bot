@@ -26,8 +26,7 @@ Bot bitta process bo‘lib ishlaydi. Scheduler xabar yuborilganini bazada qayd q
 - Ovoz berish 23:59 da yopiladi:
   - kamida 1 ta `Yo‘q` — ertaga ham o‘sha rejalashtirilgan navbatchi;
   - `Yo‘q` bo‘lmasa va kamida 1 ta `Ha` bo‘lsa — ertaga keyingi odam;
-  - ovoz bo‘lmasa, lekin navbatchi tayyorlaganini tasdiqlagan bo‘lsa — ertaga keyingi odam;
-  - ovoz ham, navbatchining tasdig‘i ham bo‘lmasa — ertaga yana o‘sha odam va admin ogohlantiriladi.
+  - ovoz bo‘lmasa — navbatchi tayyorlaganini tasdiqlagan bo‘lsa ham, ertaga yana o‘sha odam va admin ogohlantiriladi.
 - Har odam bitta ovozga ega; tugmani qayta bosib o‘z ovozini o‘zgartirishi mumkin.
 - Transfer qabul qilinib, vazifa muvaffaqiyatli yakunlansa, amalda bajargan xonadosh
   navbatning oxiriga o‘tadi. Transferni yuborgan xonadosh qabul qiluvchining avvalgi
