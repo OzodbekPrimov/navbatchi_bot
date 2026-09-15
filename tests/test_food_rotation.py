@@ -25,6 +25,7 @@ from app.models import (
 )
 from app.scheduler import DutyScheduler
 from app.services import (
+    DomainError,
     active_manual_reminder_targets,
     active_queue,
     active_supply_queue,
@@ -37,12 +38,13 @@ from app.services import (
     create_initial_assignment,
     create_supply_transfer,
     create_transfer_request,
-    decide_transfer,
     decide_supply_transfer,
+    decide_transfer,
     enqueue_group_notification,
     food_history_page,
     get_assignment_for_date,
     get_or_create_user,
+    move_queue_member,
     open_supply_task,
     queue_manual_reminders,
     reassign_today,
@@ -156,6 +158,67 @@ async def test_yes_vote_moves_completed_duty_holder_to_the_queue_tail(session):
 
 
 @pytest.mark.asyncio
+async def test_manual_food_order_controls_tomorrows_duty(session):
+    first, second, third = await add_people(session, 3)
+    assignment = await create_initial_assignment(session, date(2026, 1, 1), first.id)
+
+    # The active holder remains first; only the upcoming members are re-ordered.
+    await move_queue_member(session, third.id, -1)
+    assert [person.id for _, person in await active_queue(session)] == [
+        first.id,
+        third.id,
+        second.id,
+    ]
+    with pytest.raises(DomainError, match="birinchi o‘rnida"):
+        await move_queue_member(session, third.id, -1)
+
+    poll = await create_completion_poll(session, assignment, "Asia/Tashkent")
+    await cast_vote(
+        session, poll.id, second.id, VoteValue.YES, now=poll.closes_at - timedelta(seconds=1)
+    )
+    await resolve_poll(session, poll, now=poll.closes_at + timedelta(seconds=1))
+
+    tomorrow = await get_assignment_for_date(session, date(2026, 1, 2))
+    assert tomorrow is not None
+    assert tomorrow.assigned_user_id == third.id
+    assert [person.id for _, person in await active_queue(session)] == [
+        third.id,
+        second.id,
+        first.id,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_admin_reassignment_keeps_effective_holder_first_then_moves_them_to_tail(
+    session,
+):
+    first, second, third = await add_people(session, 3)
+    assignment = await create_initial_assignment(session, date(2026, 1, 1), first.id)
+
+    await reassign_today(session, assignment, third.id)
+    assert [person.id for _, person in await active_queue(session)] == [
+        third.id,
+        second.id,
+        first.id,
+    ]
+
+    poll = await create_completion_poll(session, assignment, "Asia/Tashkent")
+    await cast_vote(
+        session, poll.id, second.id, VoteValue.YES, now=poll.closes_at - timedelta(seconds=1)
+    )
+    await resolve_poll(session, poll, now=poll.closes_at + timedelta(seconds=1))
+
+    tomorrow = await get_assignment_for_date(session, date(2026, 1, 2))
+    assert tomorrow is not None
+    assert tomorrow.assigned_user_id == second.id
+    assert [person.id for _, person in await active_queue(session)] == [
+        second.id,
+        first.id,
+        third.id,
+    ]
+
+
+@pytest.mark.asyncio
 async def test_group_notifications_are_idempotent_and_follow_reassignment(session):
     first, second = await add_people(session, 2)
     assignment = await create_initial_assignment(session, date(2026, 1, 1), first.id)
@@ -194,6 +257,39 @@ async def test_supply_task_advances_only_after_delivery_verification(session):
     assert task.status == SupplyTaskStatus.COMPLETED
     assert state is not None
     assert state.current_user_id == second.id
+
+
+@pytest.mark.asyncio
+async def test_selected_supply_next_person_is_kept_at_queue_head(session):
+    first, second, third = await add_people(session, 3)
+    for person in (first, second, third):
+        await add_supply_queue_member(session, SupplyType.BREAD, person.id)
+
+    await set_supply_current_user(session, SupplyType.BREAD, third.id)
+    assert [person.id for _, person in await active_supply_queue(session, SupplyType.BREAD)] == [
+        third.id,
+        first.id,
+        second.id,
+    ]
+
+    task = await open_supply_task(session, SupplyType.BREAD, first.id)
+    assert task.assigned_user_id == third.id
+    poll = await report_supply_brought(session, task.id, third.id)
+    await cast_supply_vote(
+        session, poll.id, first.id, VoteValue.YES, now=poll.closes_at - timedelta(seconds=1)
+    )
+    assert (
+        await resolve_supply_poll(session, poll, now=poll.closes_at + timedelta(seconds=1)) is True
+    )
+
+    state = await session.get(SupplyRotationState, SupplyType.BREAD)
+    assert state is not None
+    assert state.current_user_id == first.id
+    assert [person.id for _, person in await active_supply_queue(session, SupplyType.BREAD)] == [
+        first.id,
+        second.id,
+        third.id,
+    ]
 
 
 @pytest.mark.asyncio

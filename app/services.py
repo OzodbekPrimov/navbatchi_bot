@@ -214,64 +214,112 @@ async def remove_queue_member(session: AsyncSession, user_id: int) -> None:
     await session.commit()
 
 
-async def move_queue_member(session: AsyncSession, user_id: int, direction: int) -> None:
+async def move_queue_member(session: AsyncSession, user_id: int, direction: int) -> bool:
+    active_assignment = await session.scalar(
+        select(FoodAssignment)
+        .where(FoodAssignment.status == AssignmentStatus.ACTIVE)
+        .order_by(FoodAssignment.duty_date)
+    )
+    if active_assignment is not None:
+        # Older installations may have been created before the queue-head
+        # invariant. Repair that state before applying a manual re-order.
+        await _move_food_member_to_front(session, active_assignment.assigned_user_id)
     entries = await active_queue(session)
     index = next((i for i, (member, _) in enumerate(entries) if member.user_id == user_id), None)
     if index is None:
         raise DomainError("Foydalanuvchi faol navbatda emas.")
     other_index = index + direction
     if other_index < 0 or other_index >= len(entries):
-        return
+        return False
+    if active_assignment is not None and (
+        user_id == active_assignment.assigned_user_id or other_index == 0
+    ):
+        raise DomainError("Bugungi navbatchi ro‘yxatning birinchi o‘rnida qoladi.")
     entries[index], entries[other_index] = entries[other_index], entries[index]
-    # Avoid a temporary unique-position collision while rewriting the order.
-    for member, _ in entries:
-        member.position = -(10_000 + member.id)
-    await session.flush()
-    for position, (member, _) in enumerate(entries, start=1):
-        member.position = position
+    await _set_food_queue_order(
+        session, entries, [member.user_id for member, _ in entries]
+    )
     await session.commit()
+    return True
 
 
-async def _next_queue_user(session: AsyncSession, scheduled_user_id: int) -> int:
-    current = await _get_member(session, scheduled_user_id, active_only=False)
-    active = await active_queue(session)
-    if not active:
-        raise DomainError("Ovqat navbati bo‘sh.")
-    if current:
-        for member, _ in active:
-            if member.position > current.position:
-                return member.user_id
-    return active[0][0].user_id
-
-
-async def _rotate_food_queue_after_completion(
-    session: AsyncSession, scheduled_user_id: int, completed_user_id: int
-) -> int:
-    """Move the effective duty holder to the tail and return tomorrow's first user.
-
-    If a duty was transferred, the scheduled user takes the effective holder's
-    old place. This preserves the sender's remaining turn while ensuring the
-    person who actually completed the work waits for every other member.
-    """
-    entries = await active_queue(session)
+async def _set_food_queue_order(
+    session: AsyncSession, entries: list[tuple[FoodQueueMember, User]], ordered_user_ids: list[int]
+) -> None:
+    """Persist a complete food-queue order without violating unique positions."""
     members = {member.user_id: member for member, _ in entries}
-    user_ids = [member.user_id for member, _ in entries]
-    if scheduled_user_id not in members or completed_user_id not in members:
-        raise DomainError("Navbatchi faol ovqat navbatida yo‘q.")
-
-    scheduled_index = user_ids.index(scheduled_user_id)
-    next_order = user_ids[scheduled_index + 1 :] + user_ids[:scheduled_index]
-    if completed_user_id != scheduled_user_id:
-        completed_index = next_order.index(completed_user_id)
-        next_order[completed_index] = scheduled_user_id
-    next_order.append(completed_user_id)
-
-    # Positions are unique, so use temporary values while rewriting the order.
+    if set(ordered_user_ids) != set(members) or len(ordered_user_ids) != len(members):
+        raise DomainError("Ovqat navbati tartibi noto‘g‘ri.")
     for member in members.values():
         member.position = -(10_000 + member.id)
     await session.flush()
-    for position, user_id in enumerate(next_order, start=1):
+    for position, user_id in enumerate(ordered_user_ids, start=1):
         members[user_id].position = position
+
+
+async def _move_food_member_to_front(session: AsyncSession, user_id: int) -> None:
+    """Make the effective duty holder the queue head, preserving everyone else's order."""
+    active = await active_queue(session)
+    if not active:
+        raise DomainError("Ovqat navbati bo‘sh.")
+    user_ids = [member.user_id for member, _ in active]
+    if user_id not in user_ids:
+        raise DomainError("Navbatchi faol ovqat navbatida yo‘q.")
+    if user_ids[0] != user_id:
+        index = user_ids.index(user_id)
+        await _set_food_queue_order(
+            session, active, [user_id, *user_ids[:index], *user_ids[index + 1 :]]
+        )
+
+
+async def _transfer_food_duty_to_front(
+    session: AsyncSession, from_user_id: int, to_user_id: int
+) -> None:
+    """Show a transferred duty at the queue head while preserving FIFO fairness.
+
+    After the recipient completes the duty and moves to the tail, the sender
+    occupies the recipient's former position. This is the established transfer
+    rule, represented directly in the visible queue during the active duty.
+    """
+    await _move_food_member_to_front(session, from_user_id)
+    entries = await active_queue(session)
+    user_ids = [member.user_id for member, _ in entries]
+    if to_user_id not in user_ids:
+        raise DomainError("Yangi navbatchi faol ovqat navbatida yo‘q.")
+    target_index = user_ids.index(to_user_id)
+    if target_index == 0:
+        return
+    await _set_food_queue_order(
+        session,
+        entries,
+        [
+            to_user_id,
+            *user_ids[1:target_index],
+            from_user_id,
+            *user_ids[target_index + 1 :],
+        ],
+    )
+
+
+async def ensure_food_queue_head(session: AsyncSession, user_id: int) -> None:
+    """Repair or enforce the visible food-queue head for an effective assignee."""
+    await _move_food_member_to_front(session, user_id)
+    await session.commit()
+
+
+async def _rotate_food_queue_after_completion(
+    session: AsyncSession, completed_user_id: int
+) -> int:
+    """Move the effective duty holder from the queue head to the tail."""
+    entries = await active_queue(session)
+    user_ids = [member.user_id for member, _ in entries]
+    if completed_user_id not in user_ids:
+        raise DomainError("Navbatchi faol ovqat navbatida yo‘q.")
+    completed_index = user_ids.index(completed_user_id)
+    next_order = (
+        user_ids[completed_index + 1 :] + user_ids[:completed_index] + [completed_user_id]
+    )
+    await _set_food_queue_order(session, entries, next_order)
     return next_order[0]
 
 
@@ -285,6 +333,7 @@ async def create_initial_assignment(session: AsyncSession, duty_date: date, user
     assignment = await get_assignment_for_date(session, duty_date)
     if assignment is not None:
         raise DomainError("Bugungi navbat allaqachon yaratilgan.")
+    await _move_food_member_to_front(session, user_id)
     assignment = FoodAssignment(duty_date=duty_date, scheduled_user_id=user_id, assigned_user_id=user_id)
     session.add(assignment)
     await session.commit()
@@ -618,21 +667,36 @@ async def remove_supply_queue_member(session: AsyncSession, supply_type: SupplyT
 
 async def move_supply_queue_member(
     session: AsyncSession, supply_type: SupplyType, user_id: int, direction: int
-) -> None:
+) -> bool:
+    active_task_ref = await session.get(SupplyActiveTask, supply_type)
+    active_task = (
+        await session.get(SupplyTask, active_task_ref.task_id) if active_task_ref else None
+    )
+    state = await session.get(SupplyRotationState, supply_type)
+    current_user_id = (
+        active_task.assigned_user_id if active_task else (state.current_user_id if state else None)
+    )
+    if current_user_id is not None:
+        # Keep the visible queue aligned with the task/state, including queues
+        # created before the queue-head invariant was introduced.
+        await _move_supply_member_to_front(session, supply_type, current_user_id)
     entries = await active_supply_queue(session, supply_type)
     index = next((i for i, (member, _) in enumerate(entries) if member.user_id == user_id), None)
     if index is None:
         raise DomainError("Foydalanuvchi ushbu navbatda yo‘q.")
     other_index = index + direction
     if other_index < 0 or other_index >= len(entries):
-        return
+        return False
+    if current_user_id is not None and (
+        user_id == current_user_id or other_index == 0
+    ):
+        raise DomainError("Hozirgi navbatchi ro‘yxatning birinchi o‘rnida qoladi.")
     entries[index], entries[other_index] = entries[other_index], entries[index]
-    for member, _ in entries:
-        member.position = -(20_000 + member.id)
-    await session.flush()
-    for position, (member, _) in enumerate(entries, start=1):
-        member.position = position
+    await _set_supply_queue_order(
+        session, entries, [member.user_id for member, _ in entries]
+    )
     await session.commit()
+    return True
 
 
 async def set_supply_current_user(session: AsyncSession, supply_type: SupplyType, user_id: int) -> None:
@@ -640,6 +704,7 @@ async def set_supply_current_user(session: AsyncSession, supply_type: SupplyType
         raise DomainError("Keyingi navbatchi ushbu navbatda bo‘lishi kerak.")
     if await session.get(SupplyActiveTask, supply_type):
         raise DomainError("Ochiq vazifa bor. Uni yakunlang yoki transfer qiling.")
+    await _move_supply_member_to_front(session, supply_type, user_id)
     state = await session.get(SupplyRotationState, supply_type, with_for_update=True)
     if state is None:
         session.add(SupplyRotationState(supply_type=supply_type, current_user_id=user_id))
@@ -648,47 +713,86 @@ async def set_supply_current_user(session: AsyncSession, supply_type: SupplyType
     await session.commit()
 
 
-async def _next_supply_user(session: AsyncSession, supply_type: SupplyType, user_id: int) -> int:
-    current = await session.scalar(
-        select(SupplyQueueMember).where(
-            SupplyQueueMember.supply_type == supply_type, SupplyQueueMember.user_id == user_id
-        )
-    )
+async def _set_supply_queue_order(
+    session: AsyncSession,
+    entries: list[tuple[SupplyQueueMember, User]],
+    ordered_user_ids: list[int],
+) -> None:
+    """Persist a complete supply-queue order without violating unique positions."""
+    members = {member.user_id: member for member, _ in entries}
+    if set(ordered_user_ids) != set(members) or len(ordered_user_ids) != len(members):
+        raise DomainError("Ta’minot navbati tartibi noto‘g‘ri.")
+    for member in members.values():
+        member.position = -(20_000 + member.id)
+    await session.flush()
+    for position, user_id in enumerate(ordered_user_ids, start=1):
+        members[user_id].position = position
+
+
+async def _move_supply_member_to_front(
+    session: AsyncSession, supply_type: SupplyType, user_id: int
+) -> None:
+    """Make the effective supply holder the queue head, preserving relative order."""
     entries = await active_supply_queue(session, supply_type)
     if not entries:
         raise DomainError("Navbat bo‘sh.")
-    if current:
-        for member, _ in entries:
-            if member.position > current.position:
-                return member.user_id
-    return entries[0][0].user_id
+    user_ids = [member.user_id for member, _ in entries]
+    if user_id not in user_ids:
+        raise DomainError("Navbatchi faol ta’minot navbatida yo‘q.")
+    if user_ids[0] != user_id:
+        index = user_ids.index(user_id)
+        await _set_supply_queue_order(
+            session, entries, [user_id, *user_ids[:index], *user_ids[index + 1 :]]
+        )
+
+
+async def _transfer_supply_duty_to_front(
+    session: AsyncSession, supply_type: SupplyType, from_user_id: int, to_user_id: int
+) -> None:
+    """Apply the food-transfer fairness rule to the visible supply queue."""
+    await _move_supply_member_to_front(session, supply_type, from_user_id)
+    entries = await active_supply_queue(session, supply_type)
+    user_ids = [member.user_id for member, _ in entries]
+    if to_user_id not in user_ids:
+        raise DomainError("Yangi navbatchi faol ta’minot navbatida yo‘q.")
+    target_index = user_ids.index(to_user_id)
+    if target_index == 0:
+        return
+    await _set_supply_queue_order(
+        session,
+        entries,
+        [
+            to_user_id,
+            *user_ids[1:target_index],
+            from_user_id,
+            *user_ids[target_index + 1 :],
+        ],
+    )
+
+
+async def ensure_supply_queue_head(
+    session: AsyncSession, supply_type: SupplyType, user_id: int
+) -> None:
+    """Repair or enforce the visible supply-queue head for its effective holder."""
+    await _move_supply_member_to_front(session, supply_type, user_id)
+    await session.commit()
 
 
 async def _rotate_supply_queue_after_completion(
     session: AsyncSession,
     supply_type: SupplyType,
-    scheduled_user_id: int,
     completed_user_id: int,
 ) -> int:
-    """Apply the same FIFO transfer rule used by the food queue."""
+    """Move the effective supply holder from the queue head to the tail."""
     entries = await active_supply_queue(session, supply_type)
-    members = {member.user_id: member for member, _ in entries}
     user_ids = [member.user_id for member, _ in entries]
-    if scheduled_user_id not in members or completed_user_id not in members:
+    if completed_user_id not in user_ids:
         raise DomainError("Navbatchi faol navbatda yo‘q.")
-
-    scheduled_index = user_ids.index(scheduled_user_id)
-    next_order = user_ids[scheduled_index + 1 :] + user_ids[:scheduled_index]
-    if completed_user_id != scheduled_user_id:
-        completed_index = next_order.index(completed_user_id)
-        next_order[completed_index] = scheduled_user_id
-    next_order.append(completed_user_id)
-
-    for member in members.values():
-        member.position = -(20_000 + member.id)
-    await session.flush()
-    for position, user_id in enumerate(next_order, start=1):
-        members[user_id].position = position
+    completed_index = user_ids.index(completed_user_id)
+    next_order = (
+        user_ids[completed_index + 1 :] + user_ids[:completed_index] + [completed_user_id]
+    )
+    await _set_supply_queue_order(session, entries, next_order)
     return next_order[0]
 
 
@@ -716,6 +820,7 @@ async def open_supply_task(session: AsyncSession, supply_type: SupplyType, reque
         raise DomainError("Admin avval bu navbat uchun birinchi odamni tanlashi kerak.")
     if await session.get(SupplyActiveTask, supply_type, with_for_update=True):
         raise DomainError("Bu tur uchun allaqachon ochiq vazifa bor.")
+    await _move_supply_member_to_front(session, supply_type, state.current_user_id)
     task = SupplyTask(
         supply_type=supply_type,
         requester_user_id=requester_user_id,
@@ -792,13 +897,13 @@ async def resolve_supply_poll(session: AsyncSession, poll: SupplyVerificationPol
     # A single objection keeps the task with the current assignee.
     passed = no_votes == 0
     poll.status = SupplyPollStatus.CLOSED
+    await _move_supply_member_to_front(session, task.supply_type, task.assigned_user_id)
     if passed:
         state = await session.get(SupplyRotationState, task.supply_type, with_for_update=True)
         assert state is not None
         state.current_user_id = await _rotate_supply_queue_after_completion(
             session,
             task.supply_type,
-            task.scheduled_user_id,
             task.assigned_user_id,
         )
         task.status = SupplyTaskStatus.COMPLETED
@@ -847,9 +952,16 @@ async def decide_supply_transfer(
     request.status = SupplyTransferStatus.ACCEPTED if accepted else SupplyTransferStatus.REJECTED
     request.resolved_at = utc_now()
     if accepted:
-        task.previous_assignee_user_id = task.assigned_user_id
+        previous_assignee_user_id = task.assigned_user_id
+        task.previous_assignee_user_id = previous_assignee_user_id
         task.assigned_user_id = recipient_user_id
         task.notification_revision += 1
+        await _transfer_supply_duty_to_front(
+            session, task.supply_type, previous_assignee_user_id, recipient_user_id
+        )
+        state = await session.get(SupplyRotationState, task.supply_type, with_for_update=True)
+        assert state is not None
+        state.current_user_id = recipient_user_id
     await session.commit()
     return request, task
 
@@ -863,9 +975,14 @@ async def reassign_supply_task(session: AsyncSession, task_id: int, user_id: int
         raise DomainError("Yangi navbatchi shu navbatdagi faol xonadosh bo‘lishi kerak.")
     if task.assigned_user_id == user_id:
         return task
-    task.previous_assignee_user_id = task.assigned_user_id
+    previous_assignee_user_id = task.assigned_user_id
+    task.previous_assignee_user_id = previous_assignee_user_id
     task.assigned_user_id = user_id
     task.notification_revision += 1
+    await _transfer_supply_duty_to_front(session, task.supply_type, previous_assignee_user_id, user_id)
+    state = await session.get(SupplyRotationState, task.supply_type, with_for_update=True)
+    assert state is not None
+    state.current_user_id = user_id
     pending_requests = await session.scalars(
         select(SupplyTransferRequest).where(
             SupplyTransferRequest.task_id == task.id,
@@ -1036,6 +1153,7 @@ async def resolve_poll(session: AsyncSession, poll: CompletionPoll, now: datetim
     yes_votes = await session.scalar(
         select(func.count(PollVote.id)).where(PollVote.poll_id == poll.id, PollVote.value == VoteValue.YES)
     ) or 0
+    await _move_food_member_to_front(session, assignment.assigned_user_id)
     # The rotation advances only when at least one roommate confirms completion and
     # nobody objects.  The duty holder's self-report is kept as supporting history,
     # but must never advance the queue on its own.
@@ -1048,13 +1166,9 @@ async def resolve_poll(session: AsyncSession, poll: CompletionPoll, now: datetim
     next_assignment = await get_assignment_for_date(session, tomorrow)
     if next_assignment is None:
         next_user_id = (
-            await _rotate_food_queue_after_completion(
-                session,
-                assignment.scheduled_user_id,
-                assignment.assigned_user_id,
-            )
+            await _rotate_food_queue_after_completion(session, assignment.assigned_user_id)
             if passed
-            else assignment.scheduled_user_id
+            else assignment.assigned_user_id
         )
         next_assignment = FoodAssignment(
             duty_date=tomorrow, scheduled_user_id=next_user_id, assigned_user_id=next_user_id
@@ -1120,9 +1234,11 @@ async def decide_transfer(
     request.status = TransferStatus.ACCEPTED if accepted else TransferStatus.REJECTED
     request.resolved_at = utc_now()
     if accepted:
+        previous_assignee_user_id = assignment.assigned_user_id
         assignment.assigned_user_id = recipient_user_id
         assignment.reported_done_at = None
         assignment.notification_revision += 1
+        await _transfer_food_duty_to_front(session, previous_assignee_user_id, recipient_user_id)
         await enqueue_group_notification(session, assignment, GroupNotificationKind.DUTY_CHANGED)
     await session.commit()
     return request, assignment
@@ -1134,9 +1250,11 @@ async def reassign_today(session: AsyncSession, assignment: FoodAssignment, user
     if await session.scalar(select(CompletionPoll.id).where(CompletionPoll.assignment_id == assignment.id)):
         raise DomainError("Kechki tekshiruv boshlanganidan keyin navbatchini almashtirib bo‘lmaydi.")
     if assignment.assigned_user_id != user_id:
+        previous_assignee_user_id = assignment.assigned_user_id
         assignment.assigned_user_id = user_id
         assignment.reported_done_at = None
         assignment.notification_revision += 1
+        await _transfer_food_duty_to_front(session, previous_assignee_user_id, user_id)
         await enqueue_group_notification(session, assignment, GroupNotificationKind.DUTY_CHANGED)
     pending_requests = await session.scalars(
         select(TransferRequest).where(

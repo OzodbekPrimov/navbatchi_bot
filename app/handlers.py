@@ -57,6 +57,8 @@ from app.services import (
     deactivate_room,
     decide_supply_transfer,
     decide_transfer,
+    ensure_food_queue_head,
+    ensure_supply_queue_head,
     food_history_page,
     get_assignment_for_date,
     get_or_create_user,
@@ -87,6 +89,58 @@ def build_router(
 
     def today_local() -> date:
         return datetime.now(zone).date()
+
+    def food_queue_buttons(entries, current_user_id: int | None) -> list[list[InlineKeyboardButton]]:
+        buttons: list[list[InlineKeyboardButton]] = []
+        for index, (_, person) in enumerate(entries, start=1):
+            if person.id == current_user_id:
+                buttons.append(
+                    [
+                        InlineKeyboardButton(
+                            text=f"{index}. 📌 {person.full_name}", callback_data="ignore"
+                        ),
+                        InlineKeyboardButton(text="—", callback_data="ignore"),
+                        InlineKeyboardButton(text="—", callback_data="ignore"),
+                    ]
+                )
+                continue
+            buttons.append(
+                [
+                    InlineKeyboardButton(text=f"{index}. {person.full_name}", callback_data="ignore"),
+                    InlineKeyboardButton(text="⬆️", callback_data=f"adm:up:{person.id}"),
+                    InlineKeyboardButton(text="⬇️", callback_data=f"adm:down:{person.id}"),
+                ]
+            )
+        return buttons
+
+    def supply_queue_buttons(
+        entries, supply_type: SupplyType, current_user_id: int | None
+    ) -> list[list[InlineKeyboardButton]]:
+        buttons: list[list[InlineKeyboardButton]] = []
+        for index, (_, person) in enumerate(entries, start=1):
+            if person.id == current_user_id:
+                buttons.append(
+                    [
+                        InlineKeyboardButton(
+                            text=f"{index}. 📌 {person.full_name}", callback_data="ignore"
+                        ),
+                        InlineKeyboardButton(text="—", callback_data="ignore"),
+                        InlineKeyboardButton(text="—", callback_data="ignore"),
+                    ]
+                )
+                continue
+            buttons.append(
+                [
+                    InlineKeyboardButton(text=f"{index}. {person.full_name}", callback_data="ignore"),
+                    InlineKeyboardButton(
+                        text="⬆️", callback_data=f"supadm:up:{supply_type.value}:{person.id}"
+                    ),
+                    InlineKeyboardButton(
+                        text="⬇️", callback_data=f"supadm:down:{supply_type.value}:{person.id}"
+                    ),
+                ]
+            )
+        return buttons
 
     async def register(message: Message) -> User:
         telegram_user = message.from_user
@@ -948,24 +1002,23 @@ def build_router(
             supply_type = SupplyType(callback.data.rsplit(":", 1)[1])
             label = "🥖 Non" if supply_type == SupplyType.BREAD else "💧 Suv"
             async with SessionFactory() as session:
-                entries = await active_supply_queue(session, supply_type)
-                status = await supply_status_text(session, supply_type)
                 active = await session.get(SupplyActiveTask, supply_type)
                 active_task = await session.get(SupplyTask, active.task_id) if active else None
+                state = await session.get(SupplyRotationState, supply_type)
+                current_user_id = (
+                    active_task.assigned_user_id if active_task else (state.current_user_id if state else None)
+                )
+                if current_user_id is not None:
+                    await ensure_supply_queue_head(session, supply_type, current_user_id)
+                entries = await active_supply_queue(session, supply_type)
+                status = await supply_status_text(session, supply_type)
             buttons = [
                 [
                     InlineKeyboardButton(text="👥 Qatnashchilar", callback_data=f"supadm:members:{supply_type.value}"),
                     InlineKeyboardButton(text="🎯 Keyingi odam", callback_data=f"supadm:current:{supply_type.value}"),
                 ]
             ]
-            for index, (_, person) in enumerate(entries, start=1):
-                buttons.append(
-                    [
-                        InlineKeyboardButton(text=f"{index}. {person.full_name}", callback_data="ignore"),
-                        InlineKeyboardButton(text="⬆️", callback_data=f"supadm:up:{supply_type.value}:{person.id}"),
-                        InlineKeyboardButton(text="⬇️", callback_data=f"supadm:down:{supply_type.value}:{person.id}"),
-                    ]
-                )
+            buttons.extend(supply_queue_buttons(entries, supply_type, current_user_id))
             if active_task and active_task.status == SupplyTaskStatus.AWAITING_DELIVERY:
                 buttons.append(
                     [
@@ -975,7 +1028,11 @@ def build_router(
                         )
                     ]
                 )
-            order = "Navbat hali tuzilmagan." if not entries else "Tartibni boshqaring yoki keyingi odamni tanlang."
+            order = (
+                "Navbat hali tuzilmagan."
+                if not entries
+                else "📌 Birinchi o‘rin hozirgi/keyingi navbatchi. Qolgan tartibni boshqaring."
+            )
             text = f"{label} navbati\n\n{status}\n\n{order}"
             await callback.message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
             await callback.answer()
@@ -1092,11 +1149,36 @@ def build_router(
         try:
             await require_admin(callback)
             _, direction, raw_type, raw_user_id = callback.data.split(":")
+            supply_type = SupplyType(raw_type)
             async with SessionFactory() as session:
-                await move_supply_queue_member(
-                    session, SupplyType(raw_type), int(raw_user_id), -1 if direction == "up" else 1
+                moved = await move_supply_queue_member(
+                    session, supply_type, int(raw_user_id), -1 if direction == "up" else 1
                 )
-            await callback.answer("Navbat tartibi yangilandi.")
+                active = await session.get(SupplyActiveTask, supply_type)
+                active_task = await session.get(SupplyTask, active.task_id) if active else None
+                state = await session.get(SupplyRotationState, supply_type)
+                current_user_id = (
+                    active_task.assigned_user_id if active_task else (state.current_user_id if state else None)
+                )
+                entries = await active_supply_queue(session, supply_type)
+            if moved:
+                buttons = [
+                    [
+                        InlineKeyboardButton(
+                            text="👥 Qatnashchilar",
+                            callback_data=f"supadm:members:{supply_type.value}",
+                        ),
+                        InlineKeyboardButton(
+                            text="🎯 Keyingi odam",
+                            callback_data=f"supadm:current:{supply_type.value}",
+                        ),
+                    ]
+                ]
+                buttons.extend(supply_queue_buttons(entries, supply_type, current_user_id))
+                await callback.message.edit_reply_markup(
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+                )
+            await callback.answer("Navbat tartibi yangilandi." if moved else "Bu oxirgi o‘rin.")
         except (DomainError, ValueError) as error:
             await callback.answer(str(error), show_alert=True)
 
@@ -1142,20 +1224,25 @@ def build_router(
         try:
             await require_admin(callback)
             async with SessionFactory() as session:
+                assignment = await current_assignment(session, today_local())
+                current_user_id = assignment.assigned_user_id if assignment else None
+                if current_user_id is not None:
+                    await ensure_food_queue_head(session, current_user_id)
                 entries = await active_queue(session)
             if not entries:
                 await callback.message.answer("Navbat bo‘sh. Avval qatnashchilarni qo‘shing.")
             else:
-                buttons = []
-                for index, (_, person) in enumerate(entries, start=1):
-                    buttons.append(
-                        [
-                            InlineKeyboardButton(text=f"{index}. {person.full_name}", callback_data="ignore"),
-                            InlineKeyboardButton(text="⬆️", callback_data=f"adm:up:{person.id}"),
-                            InlineKeyboardButton(text="⬇️", callback_data=f"adm:down:{person.id}"),
-                        ]
-                    )
-                await callback.message.answer("Navbat tartibi:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+                buttons = food_queue_buttons(entries, current_user_id)
+                hint = (
+                    "Navbat tartibi:\n\n📌 Bugungi navbatchi birinchi o‘rinda turadi. "
+                    "Qolgan qatnashchilarni tepaga-pastga surishingiz mumkin."
+                    if current_user_id is not None
+                    else "Navbat tartibi:"
+                )
+                await callback.message.answer(
+                    hint,
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+                )
             await callback.answer()
         except DomainError as error:
             await callback.answer(str(error), show_alert=True)
@@ -1166,8 +1253,19 @@ def build_router(
             await require_admin(callback)
             _, direction, raw_user_id = callback.data.split(":")
             async with SessionFactory() as session:
-                await move_queue_member(session, int(raw_user_id), -1 if direction == "up" else 1)
-            await callback.answer("Navbat tartibi yangilandi.")
+                moved = await move_queue_member(
+                    session, int(raw_user_id), -1 if direction == "up" else 1
+                )
+                assignment = await current_assignment(session, today_local())
+                current_user_id = assignment.assigned_user_id if assignment else None
+                entries = await active_queue(session)
+            if moved:
+                await callback.message.edit_reply_markup(
+                    reply_markup=InlineKeyboardMarkup(
+                        inline_keyboard=food_queue_buttons(entries, current_user_id)
+                    )
+                )
+            await callback.answer("Navbat tartibi yangilandi." if moved else "Bu oxirgi o‘rin.")
         except (DomainError, ValueError) as error:
             await callback.answer(str(error), show_alert=True)
 

@@ -19,6 +19,9 @@ Bot bitta process bo‘lib ishlaydi. Scheduler xabar yuborilganini bazada qayd q
 
 - Admin ovqat navbati ketma-ketligini boshqaradi.
 - Admin navbatni boshlaganda bugungi birinchi navbatchini tanlaydi.
+- Navbat ro‘yxatining birinchi qatori doim bugungi (non/suvda esa hozirgi yoki keyingi)
+  navbatchidir. Admin faqat undan keyingi qatnashchilar tartibini o‘zgartiradi; vazifa
+  tasdiqlanib yakunlansa, birinchi qatordagi odam ro‘yxatning oxiriga o‘tadi.
 - Navbatchiga Toshkent vaqti bilan 07:00, 12:00 va 19:00 da xabar yuboriladi. Bot vaqtincha to‘xtagan bo‘lsa, qaytganda faqat eng so‘nggi o‘tkazib yuborilgan eslatmani yuboradi.
 - Navbatchi `Ovqat tayyorladim` tugmasi bilan bajarganini qayd qilishi mumkin; bu yakuniy ovoz o‘rnini bosmaydi.
 - Bot guruhga 07:00 dan keyin bir marta bugungi navbatchini Telegram mention bilan e’lon qiladi. Navbatchi o‘zgarsa, guruhga yangi mention bilan yangilanish yuboriladi.
@@ -38,6 +41,8 @@ Bot bitta process bo‘lib ishlaydi. Scheduler xabar yuborilganini bazada qayd q
 
 - Non va suv alohida, kunlik bo‘lmagan navbatlardir.
 - Admin har biri uchun alohida qatnashchilar va boshlang‘ich/keyingi odamni belgilaydi.
+- Belgilangan keyingi odam ro‘yxatning birinchi qatoriga olib chiqiladi; shu sabab
+  ko‘rinayotgan tartib keyingi vazifa kimga berilishini aniq belgilaydi.
 - Xonadosh `🥖 Non tugadi` yoki `💧 Suv tugadi` ni tasdiqlasa, bot faqat bitta ochiq vazifa yaratadi.
 - Navbatchi guruhda mention qilinadi va shaxsiy chatida `Olib keldim` hamda `Navbatni o‘tkazish` tugmalarini oladi.
 - `Olib keldim` bosilgach, qolgan faol xonadoshlarga 30 daqiqalik `Ha / Yo‘q` tekshiruv yuboriladi.
